@@ -1,0 +1,4 @@
+# Remote Exporter Requirements
+prometheus_client>=0.14.0
+kazoo>=2.8.0
+asyncssh>=2.13.0

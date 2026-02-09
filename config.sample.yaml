@@ -1,0 +1,122 @@
+# Remote Exporter Configuration Sample
+# 
+# This file shows examples of how to configure multiple exporters
+# to run simultaneously from a single configuration file.
+#
+# Usage:
+#   remote_exporter conf --config config.yaml
+
+# Global settings (shared by all exporters)
+exporter_port: 9150        # Single HTTP port for all metrics
+collect_interval: 15.0     # Default collection interval in seconds
+max_concurrent: 10         # Maximum concurrent collections
+
+# Global SSH settings (used for all node metrics collection)
+ssh_username: root         # SSH username for node metrics
+ssh_key_file: /home/user/.ssh/id_rsa  # SSH private key file
+ssh_port: 22               # SSH port
+
+# Global region label (applied to all metrics)
+region: us-west-2          # Region label for all exporters
+
+exporters:
+  # Example 1: Node exporter - collect system metrics via SSH
+  - type: node
+    hosts:
+      - 192.168.1.10
+      - 192.168.1.11
+      - 192.168.1.12
+    username: root
+    key_file: /home/user/.ssh/id_rsa
+    ssh_port: 22
+    # Note: Node metrics are automatically collected once for all unique hosts
+
+  # Example 2: Arcus exporter - discover from ZooKeeper
+  - type: arcus
+    zookeeper_addr: localhost:2181
+    cloud_name: "prod.*"  # Regex pattern to match cloud names
+    
+    # Node metrics enabled (uses global SSH settings)
+    enable_node_metrics: true
+    include_k8s_node: false         # Exclude K8s nodes (default)
+
+  # Example 3: Memcached exporter - static memcached addresses
+  - type: memcached
+    memcached_addrs:
+      - 10.0.1.10:11211
+      - 10.0.1.11:11211
+      - 10.0.1.12:11211
+    
+    # Node metrics enabled for this instance
+    enable_node_metrics: true
+
+  # Example 4: Redis standalone exporter
+  - type: redis
+    redis_addrs:
+      - localhost:6379
+    redis_password: myredispassword
+    
+    # Node metrics enabled (uses global SSH settings)
+    enable_node_metrics: true
+
+  # Example 5: Redis Cluster exporter with auto-discovery
+  - type: redis
+    redis_addrs:
+      - redis-cluster-seed1.example.com:6379
+      - redis-cluster-seed2.example.com:6379
+    redis_password: clusterpassword
+    cluster_mode: true
+    cluster_refresh_interval: 60.0
+    
+    # Include K8s nodes (override default, uses global SSH settings)
+    enable_node_metrics: true
+    include_k8s_node: true  # Don't exclude K8s nodes
+
+  # Example 6: Multiple Redis instances
+  - type: redis
+    redis_addrs:
+      - redis1.internal:6379
+      - redis2.internal:6379
+      - redis3.internal:6379
+    
+    # Disable node metrics completely
+    enable_node_metrics: false
+
+# Notes:
+# 
+# 1. Shared Registry Architecture:
+#    - All exporters share a single HTTP port (exporter_port)
+#    - All metrics from all exporters are served on one endpoint
+#    - Node metrics are collected once for all unique hosts
+# 
+# 2. Global SSH Configuration:
+#    - ssh_username, ssh_key_file, ssh_port are set globally
+#    - All unique nodes discovered across exporters use the same SSH credentials
+#    - Can be overridden via CLI arguments (--ssh-username, --ssh-key-file, --ssh-port)
+# 
+# 3. Each exporter runs in its own thread
+# 4. All exporters start simultaneously
+# 5. Press Ctrl+C to stop all exporters
+# 
+# 6. Node metrics defaults:
+#    - enable_node_metrics: false (disabled by default)
+#    - include_k8s_node: false (excludes K8s nodes by default)
+#    - Hosts are automatically discovered from arcus/redis addresses
+#    - Duplicates are removed - each host is monitored only once
+# 
+# 7. K8s node detection checks for:
+#    - /var/lib/kubelet directory
+#    - kubelet process
+#    - /etc/kubernetes directory
+# 
+# 8. SSH authentication:
+#    - Only key_file is supported (password removed for security)
+#    - Ensure SSH keys have proper permissions (chmod 600)
+# 
+# 9. Global vs Per-Exporter Settings:
+#    - exporter_port: Global only (shared by all)
+#    - collect_interval: Global default, can be overridden per exporter
+#    - max_concurrent: Global only
+#    - ssh_username, ssh_key_file, ssh_port: Global (used for all unique nodes)
+#    - region: Global (applied to all metrics as label)
+#    - Individual exporters can override collect_interval if needed
