@@ -1,0 +1,511 @@
+#!/usr/bin/env python3
+"""
+Node Exporter - SSH-based remote node metrics collector
+
+Collects system metrics from remote hosts via SSH without requiring
+node_exporter installation.
+SSH를 통해 원격 서버의 시스템 메트릭을 수집합니다.
+node_exporter 수준의 다양한 메트릭을 지원합니다.
+"""
+
+import asyncio
+import asyncssh
+import re
+import argparse
+import logging
+import sys
+from typing import Dict, List, Optional, Tuple
+from prometheus_client import CollectorRegistry, Counter, Gauge, Info, start_http_server, generate_latest
+
+
+class RemoteNodeCollector:
+    """을 통한 원격 노드 메트릭 수집"""
+    
+    def __init__(self, hosts: List[str], username: str, key_file: str = None, 
+                 port: int = 22, timeout: int = 10):
+        self.hosts = hosts
+        self.username = username
+        self.key_file = key_file
+        self.port = port
+        self.timeout = timeout
+        self.registry = CollectorRegistry()
+        self.logger = logging.getLogger(__name__)
+        self._init_metrics()
+    
+    def _init_metrics(self):
+        """메트릭 초기화 - node_exporter 호환"""
+        
+        # Node info
+        self.node_uname_info = Info('node_uname', 'System information',
+                                    ['host'], registry=self.registry)
+        
+        # CPU metrics
+        self.node_cpu_seconds_total = Counter('node_cpu_seconds_total',
+                                              'CPU time in seconds',
+                                              ['host', 'cpu', 'mode'],
+                                              registry=self.registry)
+        
+        # Load average
+        self.node_load1 = Gauge('node_load1', 'Load average 1m',
+                               ['host'], registry=self.registry)
+        self.node_load5 = Gauge('node_load5', 'Load average 5m',
+                               ['host'], registry=self.registry)
+        self.node_load15 = Gauge('node_load15', 'Load average 15m',
+                                ['host'], registry=self.registry)
+        
+        # Memory metrics
+        self.node_memory_MemTotal_bytes = Gauge('node_memory_MemTotal_bytes',
+                                                'Total memory',
+                                                ['host'], registry=self.registry)
+        self.node_memory_MemFree_bytes = Gauge('node_memory_MemFree_bytes',
+                                               'Free memory',
+                                               ['host'], registry=self.registry)
+        self.node_memory_MemAvailable_bytes = Gauge('node_memory_MemAvailable_bytes',
+                                                    'Available memory',
+                                                    ['host'], registry=self.registry)
+        self.node_memory_Buffers_bytes = Gauge('node_memory_Buffers_bytes',
+                                               'Buffers memory',
+                                               ['host'], registry=self.registry)
+        self.node_memory_Cached_bytes = Gauge('node_memory_Cached_bytes',
+                                              'Cached memory',
+                                              ['host'], registry=self.registry)
+        self.node_memory_SwapTotal_bytes = Gauge('node_memory_SwapTotal_bytes',
+                                                 'Total swap',
+                                                 ['host'], registry=self.registry)
+        self.node_memory_SwapFree_bytes = Gauge('node_memory_SwapFree_bytes',
+                                                'Free swap',
+                                                ['host'], registry=self.registry)
+        
+        # Filesystem metrics
+        self.node_filesystem_size_bytes = Gauge('node_filesystem_size_bytes',
+                                                'Filesystem size',
+                                                ['host', 'device', 'mountpoint', 'fstype'],
+                                                registry=self.registry)
+        self.node_filesystem_avail_bytes = Gauge('node_filesystem_avail_bytes',
+                                                 'Filesystem available',
+                                                 ['host', 'device', 'mountpoint', 'fstype'],
+                                                 registry=self.registry)
+        self.node_filesystem_files = Gauge('node_filesystem_files',
+                                           'Filesystem inodes total',
+                                           ['host', 'device', 'mountpoint', 'fstype'],
+                                           registry=self.registry)
+        self.node_filesystem_files_free = Gauge('node_filesystem_files_free',
+                                                'Filesystem inodes free',
+                                                ['host', 'device', 'mountpoint', 'fstype'],
+                                                registry=self.registry)
+        
+        # Disk I/O metrics
+        self.node_disk_reads_completed_total = Counter('node_disk_reads_completed_total',
+                                                       'Disk reads completed',
+                                                       ['host', 'device'],
+                                                       registry=self.registry)
+        self.node_disk_writes_completed_total = Counter('node_disk_writes_completed_total',
+                                                        'Disk writes completed',
+                                                        ['host', 'device'],
+                                                        registry=self.registry)
+        self.node_disk_read_bytes_total = Counter('node_disk_read_bytes_total',
+                                                  'Disk bytes read',
+                                                  ['host', 'device'],
+                                                  registry=self.registry)
+        self.node_disk_written_bytes_total = Counter('node_disk_written_bytes_total',
+                                                     'Disk bytes written',
+                                                     ['host', 'device'],
+                                                     registry=self.registry)
+        
+        # Network metrics
+        self.node_network_receive_bytes_total = Counter('node_network_receive_bytes_total',
+                                                        'Network bytes received',
+                                                        ['host', 'device'],
+                                                        registry=self.registry)
+        self.node_network_transmit_bytes_total = Counter('node_network_transmit_bytes_total',
+                                                         'Network bytes transmitted',
+                                                         ['host', 'device'],
+                                                         registry=self.registry)
+        self.node_network_receive_packets_total = Counter('node_network_receive_packets_total',
+                                                          'Network packets received',
+                                                          ['host', 'device'],
+                                                          registry=self.registry)
+        self.node_network_transmit_packets_total = Counter('node_network_transmit_packets_total',
+                                                           'Network packets transmitted',
+                                                           ['host', 'device'],
+                                                           registry=self.registry)
+        self.node_network_receive_errs_total = Counter('node_network_receive_errs_total',
+                                                       'Network receive errors',
+                                                       ['host', 'device'],
+                                                       registry=self.registry)
+        self.node_network_transmit_errs_total = Counter('node_network_transmit_errs_total',
+                                                        'Network transmit errors',
+                                                        ['host', 'device'],
+                                                        registry=self.registry)
+        
+        # System metrics
+        self.node_boot_time_seconds = Gauge('node_boot_time_seconds',
+                                           'System boot time',
+                                           ['host'], registry=self.registry)
+        self.node_context_switches_total = Counter('node_context_switches_total',
+                                                   'Context switches',
+                                                   ['host'], registry=self.registry)
+        self.node_forks_total = Counter('node_forks_total',
+                                        'Process forks',
+                                        ['host'], registry=self.registry)
+        self.node_procs_running = Gauge('node_procs_running',
+                                       'Running processes',
+                                       ['host'], registry=self.registry)
+        self.node_procs_blocked = Gauge('node_procs_blocked',
+                                       'Blocked processes',
+                                       ['host'], registry=self.registry)
+        
+        # File descriptor metrics
+        self.node_filefd_allocated = Gauge('node_filefd_allocated',
+                                          'Allocated file descriptors',
+                                          ['host'], registry=self.registry)
+        self.node_filefd_maximum = Gauge('node_filefd_maximum',
+                                        'Maximum file descriptors',
+                                        ['host'], registry=self.registry)
+    
+    async def _run_command(self, conn, command: str) -> Optional[str]:
+        """원격 명령 실행"""
+        try:
+            result = await asyncio.wait_for(
+                conn.run(command, check=False),
+                timeout=self.timeout
+            )
+            if result.exit_status == 0:
+                return result.stdout
+            return None
+        except Exception as e:
+            self.logger.debug(f"Command failed: {command}: {e}")
+            return None
+    
+    async def _collect_uname(self, conn, host: str):
+        """시스템 정보 수집"""
+        output = await self._run_command(conn, 'uname -a')
+        if output:
+            parts = output.strip().split()
+            self.node_uname_info.labels(host=host).info({
+                'sysname': parts[0] if len(parts) > 0 else '',
+                'release': parts[2] if len(parts) > 2 else '',
+                'version': parts[3] if len(parts) > 3 else '',
+                'machine': parts[-1] if len(parts) > 0 else '',
+                'nodename': parts[1] if len(parts) > 1 else host
+            })
+    
+    async def _collect_cpu(self, conn, host: str):
+        """CPU 메트릭 수집"""
+        output = await self._run_command(conn, 'cat /proc/stat')
+        if not output:
+            return
+        
+        for line in output.strip().split('\n'):
+            if line.startswith('cpu'):
+                parts = line.split()
+                cpu_name = parts[0]
+                if cpu_name == 'cpu':
+                    continue  # Skip aggregate
+                
+                values = [int(x) for x in parts[1:8]]
+                modes = ['user', 'nice', 'system', 'idle', 'iowait', 'irq', 'softirq']
+                
+                for mode, value in zip(modes, values):
+                    # Convert from jiffies to seconds (assuming 100 HZ)
+                    self.node_cpu_seconds_total.labels(
+                        host=host, cpu=cpu_name, mode=mode
+                    )._value._value = value / 100.0
+    
+    async def _collect_loadavg(self, conn, host: str):
+        """Load average 수집"""
+        output = await self._run_command(conn, 'cat /proc/loadavg')
+        if output:
+            loads = output.strip().split()[:3]
+            self.node_load1.labels(host=host).set(float(loads[0]))
+            self.node_load5.labels(host=host).set(float(loads[1]))
+            self.node_load15.labels(host=host).set(float(loads[2]))
+    
+    async def _collect_memory(self, conn, host: str):
+        """메모리 메트릭 수집"""
+        output = await self._run_command(conn, 'cat /proc/meminfo')
+        if not output:
+            return
+        
+        mem_metrics = {
+            'MemTotal': self.node_memory_MemTotal_bytes,
+            'MemFree': self.node_memory_MemFree_bytes,
+            'MemAvailable': self.node_memory_MemAvailable_bytes,
+            'Buffers': self.node_memory_Buffers_bytes,
+            'Cached': self.node_memory_Cached_bytes,
+            'SwapTotal': self.node_memory_SwapTotal_bytes,
+            'SwapFree': self.node_memory_SwapFree_bytes,
+        }
+        
+        for line in output.strip().split('\n'):
+            match = re.match(r'(\w+):\s+(\d+)', line)
+            if match:
+                key, value_kb = match.groups()
+                if key in mem_metrics:
+                    mem_metrics[key].labels(host=host).set(int(value_kb) * 1024)
+    
+    async def _collect_filesystem(self, conn, host: str):
+        """파일시스템 메트릭 수집"""
+        # df with all information
+        output = await self._run_command(conn, 'df -B1 -T')
+        if not output:
+            return
+        
+        for line in output.strip().split('\n')[1:]:
+            parts = line.split()
+            if len(parts) >= 7:
+                device = parts[0]
+                fstype = parts[1]
+                size = int(parts[2])
+                used = int(parts[3])
+                avail = int(parts[4])
+                mountpoint = parts[6]
+                
+                # Skip special filesystems
+                if fstype in ['tmpfs', 'devtmpfs', 'devfs', 'proc', 'sysfs']:
+                    continue
+                
+                self.node_filesystem_size_bytes.labels(
+                    host=host, device=device, mountpoint=mountpoint, fstype=fstype
+                ).set(size)
+                self.node_filesystem_avail_bytes.labels(
+                    host=host, device=device, mountpoint=mountpoint, fstype=fstype
+                ).set(avail)
+        
+        # Inode information
+        output = await self._run_command(conn, 'df -i')
+        if output:
+            for line in output.strip().split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 6:
+                    device = parts[0]
+                    inodes = parts[1]
+                    ifree = parts[3]
+                    mountpoint = parts[5]
+                    
+                    if inodes != '-' and ifree != '-':
+                        self.node_filesystem_files.labels(
+                            host=host, device=device, mountpoint=mountpoint, fstype=''
+                        ).set(int(inodes))
+                        self.node_filesystem_files_free.labels(
+                            host=host, device=device, mountpoint=mountpoint, fstype=''
+                        ).set(int(ifree))
+    
+    async def _collect_diskstats(self, conn, host: str):
+        """디스크 I/O 통계 수집"""
+        output = await self._run_command(conn, 'cat /proc/diskstats')
+        if not output:
+            return
+        
+        for line in output.strip().split('\n'):
+            parts = line.split()
+            if len(parts) >= 14:
+                device = parts[2]
+                # Skip partitions and loop devices
+                if re.match(r'(loop|ram|sr)\d+', device) or re.match(r'[a-z]+\d+$', device):
+                    continue
+                
+                reads_completed = int(parts[3])
+                sectors_read = int(parts[5])
+                writes_completed = int(parts[7])
+                sectors_written = int(parts[9])
+                
+                self.node_disk_reads_completed_total.labels(
+                    host=host, device=device
+                )._value._value = reads_completed
+                
+                self.node_disk_writes_completed_total.labels(
+                    host=host, device=device
+                )._value._value = writes_completed
+                
+                self.node_disk_read_bytes_total.labels(
+                    host=host, device=device
+                )._value._value = sectors_read * 512
+                
+                self.node_disk_written_bytes_total.labels(
+                    host=host, device=device
+                )._value._value = sectors_written * 512
+    
+    async def _collect_network(self, conn, host: str):
+        """네트워크 통계 수집"""
+        output = await self._run_command(conn, 'cat /proc/net/dev')
+        if not output:
+            return
+        
+        for line in output.strip().split('\n')[2:]:  # Skip headers
+            if ':' not in line:
+                continue
+            
+            parts = line.split(':')
+            device = parts[0].strip()
+            stats = parts[1].split()
+            
+            if len(stats) >= 16:
+                rx_bytes = int(stats[0])
+                rx_packets = int(stats[1])
+                rx_errs = int(stats[2])
+                tx_bytes = int(stats[8])
+                tx_packets = int(stats[9])
+                tx_errs = int(stats[10])
+                
+                self.node_network_receive_bytes_total.labels(
+                    host=host, device=device
+                )._value._value = rx_bytes
+                
+                self.node_network_receive_packets_total.labels(
+                    host=host, device=device
+                )._value._value = rx_packets
+                
+                self.node_network_receive_errs_total.labels(
+                    host=host, device=device
+                )._value._value = rx_errs
+                
+                self.node_network_transmit_bytes_total.labels(
+                    host=host, device=device
+                )._value._value = tx_bytes
+                
+                self.node_network_transmit_packets_total.labels(
+                    host=host, device=device
+                )._value._value = tx_packets
+                
+                self.node_network_transmit_errs_total.labels(
+                    host=host, device=device
+                )._value._value = tx_errs
+    
+    async def _collect_vmstat(self, conn, host: str):
+        """시스템 통계 수집"""
+        output = await self._run_command(conn, 'cat /proc/stat')
+        if not output:
+            return
+        
+        for line in output.strip().split('\n'):
+            if line.startswith('ctxt '):
+                ctxt = int(line.split()[1])
+                self.node_context_switches_total.labels(host=host)._value._value = ctxt
+            elif line.startswith('processes '):
+                forks = int(line.split()[1])
+                self.node_forks_total.labels(host=host)._value._value = forks
+            elif line.startswith('procs_running '):
+                running = int(line.split()[1])
+                self.node_procs_running.labels(host=host).set(running)
+            elif line.startswith('procs_blocked '):
+                blocked = int(line.split()[1])
+                self.node_procs_blocked.labels(host=host).set(blocked)
+            elif line.startswith('btime '):
+                btime = int(line.split()[1])
+                self.node_boot_time_seconds.labels(host=host).set(btime)
+    
+    async def _collect_filefd(self, conn, host: str):
+        """파일 디스크립터 통계 수집"""
+        output = await self._run_command(conn, 'cat /proc/sys/fs/file-nr')
+        if output:
+            parts = output.strip().split()
+            if len(parts) >= 3:
+                self.node_filefd_allocated.labels(host=host).set(int(parts[0]))
+                self.node_filefd_maximum.labels(host=host).set(int(parts[2]))
+    
+    async def collect_from_host(self, host: str):
+        """하나의 호스트에서 모든 메트릭 수집"""
+        try:
+            self.logger.info(f"Connecting to {host}...")
+            
+            async with asyncssh.connect(
+                host,
+                port=self.port,
+                username=self.username,
+                client_keys=[self.key_file] if self.key_file else None,
+                known_hosts=None
+            ) as conn:
+                # 모든 메트릭을 병렬로 수집
+                await asyncio.gather(
+                    self._collect_uname(conn, host),
+                    self._collect_cpu(conn, host),
+                    self._collect_loadavg(conn, host),
+                    self._collect_memory(conn, host),
+                    self._collect_filesystem(conn, host),
+                    self._collect_diskstats(conn, host),
+                    self._collect_network(conn, host),
+                    self._collect_vmstat(conn, host),
+                    self._collect_filefd(conn, host),
+                    return_exceptions=True
+                )
+                
+                self.logger.debug(f"Collected metrics from {host}")
+        
+        except Exception as e:
+            self.logger.error(f"Failed to collect from {host}: {e}")
+    
+    async def collect_all(self):
+        """모든 호스트에서 메트릭 수집"""
+        tasks = [self.collect_from_host(host) for host in self.hosts]
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    def get_metrics(self) -> bytes:
+        """Prometheus 포맷으로 메트릭 반환"""
+        return generate_latest(self.registry)
+
+
+async def collection_loop(collector: RemoteNodeCollector, interval: int):
+    """주기적으로 메트릭 수집"""
+    logger = logging.getLogger(__name__)
+    logger.info("Starting collection loop")
+    
+    while True:
+        try:
+            await collector.collect_all()
+        except Exception as e:
+            logger.error(f"Collection error: {e}")
+        
+        await asyncio.sleep(interval)
+
+
+def run_node_exporter(args=None):
+    """Run node exporter"""
+    parser = argparse.ArgumentParser(description='Remote Node Exporter via SSH')
+    parser.add_argument('--hosts', nargs='+', required=True,
+                       help='Remote hosts to monitor')
+    parser.add_argument('--username', required=True,
+                       help='SSH username')
+    parser.add_argument('--key-file', 
+                       help='SSH private key file')
+    parser.add_argument('--port', type=int, default=22,
+                       help='SSH port (default: 22)')
+    parser.add_argument('--exporter-port', type=int, default=9100,
+                       help='Exporter HTTP port (default: 9100)')
+    parser.add_argument('--collect-interval', type=int, default=15,
+                       help='Collection interval in seconds (default: 15)')
+    parser.add_argument('--log-level', default='INFO',
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help='Log level (default: INFO)')
+    
+    args = parser.parse_args(args)
+    
+    # Setup logging
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    logger = logging.getLogger(__name__)
+    
+    # Create collector
+    collector = RemoteNodeCollector(
+        hosts=args.hosts,
+        username=args.username,
+        key_file=args.key_file,
+        port=args.port
+    )
+    
+    # Start HTTP server
+    start_http_server(args.exporter_port, registry=collector.registry)
+    logger.info(f"Exporter listening on port {args.exporter_port}")
+    
+    # Start collection loop
+    try:
+        asyncio.run(collection_loop(collector, args.collect_interval))
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+
+
+if __name__ == '__main__':
+    run_node_exporter()
