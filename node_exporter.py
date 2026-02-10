@@ -40,7 +40,9 @@ class RemoteNodeCollector:
         
         # SSH connection pool: {host: connection}
         self.connections = {}
-        self.connection_lock = asyncio.Lock()
+        # Use threading.Lock instead of asyncio.Lock to avoid event loop binding issues
+        import threading
+        self.connection_lock = threading.Lock()
         
         self._init_metrics()
     
@@ -419,7 +421,7 @@ class RemoteNodeCollector:
     async def _get_connection(self, host: str):
         """Get or create SSH connection from pool"""
         # First, check if we have an existing connection (with lock)
-        async with self.connection_lock:
+        with self.connection_lock:
             if host in self.connections:
                 conn = self.connections[host]
                 # Test if connection is still alive
@@ -452,7 +454,7 @@ class RemoteNodeCollector:
         )
         
         # Add to pool (with lock)
-        async with self.connection_lock:
+        with self.connection_lock:
             # Double-check in case another task created connection while we were connecting
             if host in self.connections:
                 # Another task already connected, close ours and use existing
@@ -464,6 +466,15 @@ class RemoteNodeCollector:
     
     async def collect_from_host(self, host: str):
         """하나의 호스트에서 모든 메트릭 수집"""
+        try:
+            return await self._collect_from_host_impl(host)
+        except Exception as e:
+            # Catch any unexpected exceptions and log with host info
+            self.logger.error(f"Unexpected exception collecting from {host}: {type(e).__name__}: {e}", exc_info=True)
+            return ('exception', host, e)
+    
+    async def _collect_from_host_impl(self, host: str):
+        """Internal implementation of collect_from_host"""
         # Check if this host is in bad_hosts and if retry interval has passed
         current_time = time.time()
         if host in self.bad_hosts:
@@ -504,23 +515,24 @@ class RemoteNodeCollector:
             return 'success'
         
         except (asyncssh.Error, OSError, TimeoutError) as e:
-            # Connection/authentication failed, add to bad_hosts and remove from pool
+            # SSH connection failed - add to bad_hosts (network/firewall issue)
             self.bad_hosts[host] = current_time
-            async with self.connection_lock:
+            with self.connection_lock:
                 if host in self.connections:
                     del self.connections[host]
             # Only log first few failures to avoid log spam
             if len(self.bad_hosts) <= 10:
-                self.logger.warning(f"Failed to collect from {host}: {e}")
+                self.logger.warning(f"SSH connection failed for {host}: {e}")
             return 'failed'
         except Exception as e:
-            # Other errors, also add to bad_hosts to avoid retrying too soon
-            self.bad_hosts[host] = current_time
-            async with self.connection_lock:
+            # Other errors during metric collection - DO NOT add to bad_hosts
+            # These are usually transient errors, connection is still valid
+            with self.connection_lock:
                 if host in self.connections:
-                    del self.connections[host]
-            self.logger.error(f"Failed to collect from {host}: {type(e).__name__}: {e}")
-            return 'failed'
+                    # Keep connection alive for next attempt
+                    pass
+            self.logger.warning(f"Metric collection error from {host}: {type(e).__name__}: {e}")
+            return 'error'  # Different from 'failed' - not added to bad_hosts
     
     def update_hosts(self, new_hosts: List[str]):
         """호스트 목록 동적 업데이트"""
@@ -560,17 +572,32 @@ class RemoteNodeCollector:
         # Count results
         success_count = sum(1 for r in results if r == 'success')
         skipped_count = sum(1 for r in results if r == 'skipped')
-        failed_count = sum(1 for r in results if r == 'failed')
-        exceptions = [r for r in results if isinstance(r, Exception)]
+        failed_count = sum(1 for r in results if r == 'failed')  # SSH connection failures only
+        error_count = sum(1 for r in results if r == 'error')    # Metric collection errors (not in bad_hosts)
         
-        # Log summary (only if there are issues or first few iterations)
-        if failed_count > 0 or skipped_count > 0 or exceptions:
-            self.logger.info(f"Collected from {success_count}/{total_hosts} hosts in {elapsed:.2f}s (skipped: {skipped_count}, failed: {failed_count})")
+        # Extract exception tuples: ('exception', host, exception)
+        exception_tuples = [r for r in results if isinstance(r, tuple) and len(r) == 3 and r[0] == 'exception']
+        exception_count = len(exception_tuples)
+        
+        # Log summary
+        if failed_count > 0 or error_count > 0 or exception_count > 0:
+            msg = f"Collected from {success_count}/{total_hosts} hosts in {elapsed:.2f}s"
+            if skipped_count > 0:
+                msg += f" (skipped: {skipped_count})"
+            if failed_count > 0:
+                msg += f" (conn failed: {failed_count})"
+            if error_count > 0:
+                msg += f" (errors: {error_count})"
+            if exception_count > 0:
+                msg += f" (exceptions: {exception_count})"
+            self.logger.info(msg)
         else:
             self.logger.info(f"Collected metrics from {total_hosts} node hosts in {elapsed:.2f}s")
         
-        if exceptions:
-            self.logger.error(f"Unexpected exceptions: {[type(e).__name__ for e in exceptions[:3]]}")
+        # Log detailed exception information (already logged in collect_from_host, just show summary)
+        if exception_count > 0:
+            hosts_with_exceptions = [host for _, host, _ in exception_tuples[:5]]
+            self.logger.error(f"Hosts with exceptions: {hosts_with_exceptions}")
     
     def get_metrics(self) -> bytes:
         """Prometheus 포맷으로 메트릭 반환"""
