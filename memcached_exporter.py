@@ -847,8 +847,9 @@ def run_memcached_exporter(args_list=None):
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
+    )    
+    # Reduce asyncssh verbose logging (connection/channel events)
+    logging.getLogger('asyncssh').setLevel(logging.WARNING)    
     # Create default labels
     default_labels = {}
     if args.region:

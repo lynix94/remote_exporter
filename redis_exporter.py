@@ -714,8 +714,9 @@ def run_redis_exporter(args=None):
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
+    )    
+    # Reduce asyncssh verbose logging (connection/channel events)
+    logging.getLogger('asyncssh').setLevel(logging.WARNING)    
     logger = logging.getLogger(__name__)
     
     # Create and start exporter

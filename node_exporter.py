@@ -533,8 +533,12 @@ class RemoteNodeCollector:
     
     async def collect_all(self):
         """모든 호스트에서 메트릭 수집"""
+        start_time = time.time()
         tasks = [self.collect_from_host(host) for host in self.hosts]
         await asyncio.gather(*tasks, return_exceptions=True)
+        elapsed = time.time() - start_time
+        
+        self.logger.info(f"Collected metrics from {len(self.hosts)} node hosts in {elapsed:.2f}s")
     
     def get_metrics(self) -> bytes:
         """Prometheus 포맷으로 메트릭 반환"""
@@ -585,8 +589,9 @@ def run_node_exporter(args=None):
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
+    )    
+    # Reduce asyncssh verbose logging (connection/channel events)
+    logging.getLogger('asyncssh').setLevel(logging.WARNING)    
     logger = logging.getLogger(__name__)
     
     # Create collector

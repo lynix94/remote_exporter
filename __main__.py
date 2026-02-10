@@ -14,8 +14,6 @@ import sys
 import threading
 import time
 import logging
-import gzip
-from io import BytesIO
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 try:
@@ -23,6 +21,10 @@ try:
     YAML_AVAILABLE = True
 except ImportError:
     YAML_AVAILABLE = False
+
+# Import refactored components
+from result_table import ResultTable
+from metrics_cache import MetricsCache
 
 
 def main():
@@ -58,12 +60,41 @@ Examples:
 
 
 def run_from_config(config_file: str, log_level: str = 'INFO'):
-    """Run multiple exporters from YAML configuration file with shared registry"""
+    """
+    Run multiple exporters from YAML configuration file with shared registry.
+    
+    Architecture:
+    1. ResultTable: Shared metrics storage (wraps Prometheus CollectorRegistry)
+       - All exporters update metrics to this shared table asynchronously
+       - Thread-safe for concurrent updates from multiple exporters
+    
+    2. MetricsCache: Background cache manager
+       - Periodically generates Prometheus-formatted metrics from ResultTable
+       - Pre-compresses data with gzip for efficient network transfer
+       - Runs in dedicated background thread
+    
+    3. Exporters: Independent metric collectors
+       - Each exporter runs in its own thread
+       - Asynchronously collects metrics and updates ResultTable
+       - No blocking - collectors run independently
+    
+    4. HTTP Server: Serves cached metrics
+       - Returns pre-generated metrics from cache
+       - No on-demand generation - instant response
+       - Supports gzip compression
+    
+    Args:
+        config_file: Path to YAML configuration file
+        log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
+    """
     logging.basicConfig(
         level=getattr(logging, log_level),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     )
     logger = logging.getLogger(__name__)
+    
+    # Reduce asyncssh verbose logging (connection/channel events)
+    logging.getLogger('asyncssh').setLevel(logging.WARNING)
     
     try:
         with open(config_file, 'r') as f:
@@ -102,77 +133,16 @@ def run_from_config(config_file: str, log_level: str = 'INFO'):
     logger.info(f"Shared settings - port: {exporter_port}, interval: {collect_interval}s, max_concurrent: {max_concurrent}, region: {region}")
     logger.info(f"SSH settings - username: {ssh_username}, key_file: {ssh_key_file}, port: {ssh_port}")
     
-    # Create shared registry
-    from prometheus_client.core import CollectorRegistry
-    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-    shared_registry = CollectorRegistry()
+    # Create shared result table (wraps CollectorRegistry)
+    result_table = ResultTable()
+    shared_registry = result_table.get_registry()
+    logger.info(f"Created shared result table: {result_table}")
     
-    # Metrics cache for performance
-    metrics_cache = {'data': None, 'compressed': None, 'timestamp': 0, 'lock': threading.Lock()}
-    cache_ttl = 10  # Regenerate every 10 seconds in background
-    
-    def update_metrics_cache():
-        """Background task to update metrics cache"""
-        logger.info("Starting background metrics cache updater")
-        
-        # Do initial update immediately
-        try:
-            logger.info("Performing initial metrics cache update...")
-            metrics_data = generate_latest(shared_registry)
-            
-            # Compress data
-            compressed = BytesIO()
-            with gzip.GzipFile(fileobj=compressed, mode='wb', compresslevel=6) as f:
-                f.write(metrics_data)
-            compressed_data = compressed.getvalue()
-            
-            # Update cache
-            with metrics_cache['lock']:
-                metrics_cache['data'] = metrics_data
-                metrics_cache['compressed'] = compressed_data
-                metrics_cache['timestamp'] = time.time()
-            
-            if len(metrics_data) > 0:
-                ratio = 100 * len(compressed_data) / len(metrics_data)
-                logger.info(f"Initial metrics cache ready: {len(metrics_data)} bytes raw, {len(compressed_data)} bytes compressed ({ratio:.1f}% ratio)")
-            else:
-                logger.warning(f"Initial metrics cache is empty - no metrics registered yet")
-        except Exception as e:
-            logger.error(f"Error in initial metrics cache update: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-        
-        # Continue with periodic updates
-        while True:
-            try:
-                time.sleep(cache_ttl)
-                
-                # Generate metrics
-                metrics_data = generate_latest(shared_registry)
-                
-                # Compress data
-                compressed = BytesIO()
-                with gzip.GzipFile(fileobj=compressed, mode='wb', compresslevel=6) as f:
-                    f.write(metrics_data)
-                compressed_data = compressed.getvalue()
-                
-                # Update cache
-                with metrics_cache['lock']:
-                    metrics_cache['data'] = metrics_data
-                    metrics_cache['compressed'] = compressed_data
-                    metrics_cache['timestamp'] = time.time()
-                
-                # Calculate compression ratio, handle empty metrics
-                if len(metrics_data) > 0:
-                    ratio = 100 * len(compressed_data) / len(metrics_data)
-                    logger.debug(f"Metrics cache updated: {len(metrics_data)} bytes raw, {len(compressed_data)} bytes compressed ({ratio:.1f}% ratio)")
-                else:
-                    logger.debug(f"Metrics cache updated: empty metrics")
-                
-            except Exception as e:
-                logger.error(f"Error updating metrics cache: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+    # Create metrics cache with background updater
+    cache_ttl = 10  # Update cache every 10 seconds
+    metrics_cache = MetricsCache(result_table, update_interval=cache_ttl, compress_level=6)
+    metrics_cache.start()
+    logger.info(f"Started metrics cache (update_interval={cache_ttl}s)")
     
     class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
         """HTTP Server with threading support for concurrent requests"""
@@ -180,7 +150,7 @@ def run_from_config(config_file: str, log_level: str = 'INFO'):
         allow_reuse_address = True
     
     class CachedMetricsHandler(BaseHTTPRequestHandler):
-        """HTTP handler with pre-cached and compressed metrics"""
+        """HTTP handler serving pre-cached and compressed metrics"""
         
         def log_message(self, format, *args):
             """Suppress default logging"""
@@ -189,32 +159,26 @@ def run_from_config(config_file: str, log_level: str = 'INFO'):
         def do_GET(self):
             if self.path == '/metrics':
                 try:
+                    # Check if client accepts gzip
                     accept_encoding = self.headers.get('Accept-Encoding', '')
                     use_gzip = 'gzip' in accept_encoding
                     
-                    # Use cached data (always ready from background thread)
-                    with metrics_cache['lock']:
-                        if use_gzip and metrics_cache['compressed']:
-                            response_data = metrics_cache['compressed']
-                            self.send_response(200)
-                            self.send_header('Content-Type', CONTENT_TYPE_LATEST)
-                            self.send_header('Content-Encoding', 'gzip')
-                            self.send_header('Content-Length', str(len(response_data)))
-                            self.end_headers()
-                            self.wfile.write(response_data)
-                        elif metrics_cache['data']:
-                            response_data = metrics_cache['data']
-                            self.send_response(200)
-                            self.send_header('Content-Type', CONTENT_TYPE_LATEST)
-                            self.send_header('Content-Length', str(len(response_data)))
-                            self.end_headers()
-                            self.wfile.write(response_data)
-                        else:
-                            # Cache not ready yet (startup)
-                            self.send_response(503)
-                            self.send_header('Content-Type', 'text/plain')
-                            self.end_headers()
-                            self.wfile.write(b'Metrics cache initializing, please retry in a few seconds\n')
+                    # Get cached metrics
+                    data, headers = metrics_cache.get_metrics(accept_gzip=use_gzip)
+                    
+                    if data is None:
+                        # Cache not ready yet (startup)
+                        self.send_response(503)
+                        self.send_header('Content-Type', 'text/plain')
+                        self.end_headers()
+                        self.wfile.write(b'Metrics cache initializing, please retry in a few seconds\n')
+                    else:
+                        # Serve cached data
+                        self.send_response(200)
+                        for header_name, header_value in headers.items():
+                            self.send_header(header_name, header_value)
+                        self.end_headers()
+                        self.wfile.write(data)
                 
                 except (BrokenPipeError, ConnectionResetError):
                     # Client disconnected, ignore silently
@@ -373,12 +337,8 @@ def run_from_config(config_file: str, log_level: str = 'INFO'):
         node_thread.start()
         logger.info(f"Started shared node collector (interval: {collect_interval}s, hosts: {len(all_hosts)})")
     
-    # Start background metrics cache updater
-    cache_updater_thread = threading.Thread(target=update_metrics_cache, daemon=True, name='cache-updater')
-    cache_updater_thread.start()
-    logger.info(f"Started background metrics cache updater (interval: {cache_ttl}s)")
-    
     # Wait a moment for initial cache to be ready
+    logger.info("Waiting for initial metrics cache update...")
     time.sleep(2)
     
     # Start shared HTTP server with threading support for concurrent requests
