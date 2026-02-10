@@ -418,8 +418,8 @@ class RemoteNodeCollector:
     
     async def _get_connection(self, host: str):
         """Get or create SSH connection from pool"""
+        # First, check if we have an existing connection (with lock)
         async with self.connection_lock:
-            # Check if we have an existing connection
             if host in self.connections:
                 conn = self.connections[host]
                 # Test if connection is still alive
@@ -440,18 +440,26 @@ class RemoteNodeCollector:
                     self.logger.debug(f"Connection to {host} failed test, reconnecting")
                     if host in self.connections:
                         del self.connections[host]
-            
-            # Create new connection
-            self.logger.info(f"Creating new SSH connection to {host} as user {self.username}...")
-            conn = await asyncssh.connect(
-                host,
-                port=self.port,
-                username=self.username,
-                client_keys=[self.key_file] if self.key_file else None,
-                known_hosts=None
-            )
+        
+        # Create new connection OUTSIDE the lock (slow operation - allows parallel connections)
+        self.logger.debug(f"Creating new SSH connection to {host} as user {self.username}...")
+        conn = await asyncssh.connect(
+            host,
+            port=self.port,
+            username=self.username,
+            client_keys=[self.key_file] if self.key_file else None,
+            known_hosts=None
+        )
+        
+        # Add to pool (with lock)
+        async with self.connection_lock:
+            # Double-check in case another task created connection while we were connecting
+            if host in self.connections:
+                # Another task already connected, close ours and use existing
+                conn.close()
+                return self.connections[host]
             self.connections[host] = conn
-            self.logger.info(f"New connection established to {host}")
+            self.logger.debug(f"New connection established to {host}")
             return conn
     
     async def collect_from_host(self, host: str):
@@ -462,10 +470,8 @@ class RemoteNodeCollector:
             last_attempt = self.bad_hosts[host]
             time_since_last_attempt = current_time - last_attempt
             if time_since_last_attempt < self.bad_host_retry_interval:
-                # Skip this host, will retry after interval
-                remaining = self.bad_host_retry_interval - time_since_last_attempt
-                self.logger.debug(f"Skipping bad host {host} (retry in {remaining/60:.1f} minutes)")
-                return
+                # Skip this host, will retry after interval (silently skip, counted elsewhere)
+                return 'skipped'
             else:
                 # Retry interval has passed, remove from bad_hosts and try again
                 self.logger.info(f"Retrying connection to previously failed host {host} (last attempt {time_since_last_attempt/60:.1f} minutes ago)")
@@ -495,6 +501,7 @@ class RemoteNodeCollector:
                 self.logger.info(f"Host {host} recovered, removed from bad hosts list")
             
             self.logger.debug(f"Collected metrics from {host}")
+            return 'success'
         
         except (asyncssh.Error, OSError, TimeoutError) as e:
             # Connection/authentication failed, add to bad_hosts and remove from pool
@@ -502,14 +509,18 @@ class RemoteNodeCollector:
             async with self.connection_lock:
                 if host in self.connections:
                     del self.connections[host]
-            self.logger.warning(f"Failed to collect from {host}: {e} - added to bad hosts list (will retry in 1 hour)")
+            # Only log first few failures to avoid log spam
+            if len(self.bad_hosts) <= 10:
+                self.logger.warning(f"Failed to collect from {host}: {e}")
+            return 'failed'
         except Exception as e:
             # Other errors, also add to bad_hosts to avoid retrying too soon
             self.bad_hosts[host] = current_time
             async with self.connection_lock:
                 if host in self.connections:
                     del self.connections[host]
-            self.logger.error(f"Failed to collect from {host}: {e} - added to bad hosts list")
+            self.logger.error(f"Failed to collect from {host}: {type(e).__name__}: {e}")
+            return 'failed'
     
     def update_hosts(self, new_hosts: List[str]):
         """호스트 목록 동적 업데이트"""
@@ -522,23 +533,44 @@ class RemoteNodeCollector:
         new_host_set = set(new_hosts)
         added_hosts = new_host_set - current_hosts
         
-        self.logger.info(f"[NODE COLLECTOR] update_hosts called: current={len(current_hosts)}, new={len(new_host_set)}, to_add={len(added_hosts)}")
-        
         if added_hosts:
             self.hosts.extend(list(added_hosts))
-            self.logger.warning(f"[NODE COLLECTOR] ✓ Added {len(added_hosts)} new hosts: {sorted(added_hosts)}")
-            self.logger.warning(f"[NODE COLLECTOR] ✓ Total hosts now: {len(self.hosts)} hosts")
+            self.logger.info(f"Added {len(added_hosts)} new hosts (total: {len(self.hosts)})")
+            self.logger.debug(f"New hosts: {sorted(list(added_hosts)[:5])}{'...' if len(added_hosts) > 5 else ''}")
         else:
-            self.logger.info(f"[NODE COLLECTOR] No new hosts to add (all {len(new_host_set)} hosts already tracked)")
+            self.logger.debug(f"No new hosts to add ({len(new_host_set)} already tracked)")
     
     async def collect_all(self):
         """모든 호스트에서 메트릭 수집"""
         start_time = time.time()
+        
+        # Debug: Check how many hosts we have and how many are in bad_hosts
+        total_hosts = len(self.hosts)
+        bad_hosts_count = len(self.bad_hosts)
+        active_hosts = total_hosts - bad_hosts_count
+        
+        if total_hosts == 0:
+            self.logger.warning(f"[NODE COLLECTOR] No hosts to collect from! hosts list is empty")
+            return
+        
         tasks = [self.collect_from_host(host) for host in self.hosts]
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.time() - start_time
         
-        self.logger.info(f"Collected metrics from {len(self.hosts)} node hosts in {elapsed:.2f}s")
+        # Count results
+        success_count = sum(1 for r in results if r == 'success')
+        skipped_count = sum(1 for r in results if r == 'skipped')
+        failed_count = sum(1 for r in results if r == 'failed')
+        exceptions = [r for r in results if isinstance(r, Exception)]
+        
+        # Log summary (only if there are issues or first few iterations)
+        if failed_count > 0 or skipped_count > 0 or exceptions:
+            self.logger.info(f"Collected from {success_count}/{total_hosts} hosts in {elapsed:.2f}s (skipped: {skipped_count}, failed: {failed_count})")
+        else:
+            self.logger.info(f"Collected metrics from {total_hosts} node hosts in {elapsed:.2f}s")
+        
+        if exceptions:
+            self.logger.error(f"Unexpected exceptions: {[type(e).__name__ for e in exceptions[:3]]}")
     
     def get_metrics(self) -> bytes:
         """Prometheus 포맷으로 메트릭 반환"""
