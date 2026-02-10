@@ -37,7 +37,8 @@ class ArcusPrometheusExporter(MemcachedPrometheusExporter):
                  exclude_k8s_node: bool = True,
                  ssh_username: str = None,
                  ssh_key_file: str = None,
-                 ssh_port: int = 22):
+                 ssh_port: int = 22,
+                 shared_node_collector=None):
         
         # ZooKeeper settings
         self.zookeeper_addr = zookeeper_addr
@@ -45,6 +46,12 @@ class ArcusPrometheusExporter(MemcachedPrometheusExporter):
         self.zk_client = None
         self.cloud_instance_map = {}  # Maps instance address to cloud name
         self._cloud_map_lock = threading.Lock()
+        self.shared_node_collector = shared_node_collector  # Reference to shared node collector
+        
+        # Debug log to verify shared_node_collector is passed
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"[ARCUS INIT] shared_node_collector = {shared_node_collector}, type = {type(shared_node_collector)}")
         
         # Initialize base class with empty list (will be populated by ZooKeeper)
         super().__init__(
@@ -532,6 +539,30 @@ class ArcusPrometheusExporter(MemcachedPrometheusExporter):
             
         except Exception as e:
             self.logger.error(f"Failed to setup ZooKeeper watcher: {e}")
+    
+    def _update_clients(self, addrs: List[str]):
+        """Override parent method to also update shared node collector"""
+        # Call parent's _update_clients first
+        super()._update_clients(addrs)
+        
+        # Extract unique hosts for node collector
+        if self.shared_node_collector and addrs:
+            hosts_for_node_collector = []
+            for addr in addrs:
+                if ':' in addr:
+                    host, _ = addr.rsplit(':', 1)
+                else:
+                    host = addr
+                hosts_for_node_collector.append(host)
+            
+            unique_hosts = list(set(hosts_for_node_collector))
+            if unique_hosts:
+                self.logger.warning(f"[ARCUS->NODE] Updating node collector with {len(unique_hosts)} unique hosts from ZooKeeper: {sorted(unique_hosts)[:5]}{'...' if len(unique_hosts) > 5 else ''}")
+                self.shared_node_collector.update_hosts(unique_hosts)
+        elif not self.shared_node_collector:
+            self.logger.warning("[ARCUS->NODE] shared_node_collector is None, cannot update hosts")
+        elif not addrs:
+            self.logger.warning("[ARCUS->NODE] No addresses to update")
 
     def _watch_cache_list(self, path: str):
         """Watch cache_list for changes"""

@@ -14,6 +14,7 @@ import re
 import argparse
 import logging
 import sys
+import time
 from typing import Dict, List, Optional, Tuple
 from prometheus_client import CollectorRegistry, Counter, Gauge, Info, start_http_server, generate_latest
 
@@ -22,14 +23,25 @@ class RemoteNodeCollector:
     """을 통한 원격 노드 메트릭 수집"""
     
     def __init__(self, hosts: List[str], username: str, key_file: str = None, 
-                 port: int = 22, timeout: int = 10):
+                 port: int = 22, timeout: int = 10, registry: CollectorRegistry = None):
         self.hosts = hosts
         self.username = username
         self.key_file = key_file
         self.port = port
         self.timeout = timeout
-        self.registry = CollectorRegistry()
+        self.registry = registry if registry is not None else CollectorRegistry()
         self.logger = logging.getLogger(__name__)
+        self.logger.warning(f"[NODE COLLECTOR INIT] username={username}, key_file={key_file}, port={port}, hosts={len(hosts)}")
+        
+        # Track failed hosts to avoid repeated connection attempts
+        # Format: {host: last_attempt_timestamp}
+        self.bad_hosts = {}
+        self.bad_host_retry_interval = 3600  # 1 hour in seconds
+        
+        # SSH connection pool: {host: connection}
+        self.connections = {}
+        self.connection_lock = asyncio.Lock()
+        
         self._init_metrics()
     
     def _init_metrics(self):
@@ -404,36 +416,120 @@ class RemoteNodeCollector:
                 self.node_filefd_allocated.labels(host=host).set(int(parts[0]))
                 self.node_filefd_maximum.labels(host=host).set(int(parts[2]))
     
-    async def collect_from_host(self, host: str):
-        """하나의 호스트에서 모든 메트릭 수집"""
-        try:
-            self.logger.info(f"Connecting to {host}...")
+    async def _get_connection(self, host: str):
+        """Get or create SSH connection from pool"""
+        async with self.connection_lock:
+            # Check if we have an existing connection
+            if host in self.connections:
+                conn = self.connections[host]
+                # Test if connection is still alive
+                try:
+                    result = await asyncio.wait_for(
+                        conn.run('echo test', check=False),
+                        timeout=2
+                    )
+                    if result.exit_status == 0:
+                        self.logger.debug(f"Reusing connection to {host}")
+                        return conn
+                    else:
+                        # Connection dead, remove it
+                        self.logger.debug(f"Connection to {host} is dead, reconnecting")
+                        del self.connections[host]
+                except:
+                    # Connection failed, remove it
+                    self.logger.debug(f"Connection to {host} failed test, reconnecting")
+                    if host in self.connections:
+                        del self.connections[host]
             
-            async with asyncssh.connect(
+            # Create new connection
+            self.logger.info(f"Creating new SSH connection to {host} as user {self.username}...")
+            conn = await asyncssh.connect(
                 host,
                 port=self.port,
                 username=self.username,
                 client_keys=[self.key_file] if self.key_file else None,
                 known_hosts=None
-            ) as conn:
-                # 모든 메트릭을 병렬로 수집
-                await asyncio.gather(
-                    self._collect_uname(conn, host),
-                    self._collect_cpu(conn, host),
-                    self._collect_loadavg(conn, host),
-                    self._collect_memory(conn, host),
-                    self._collect_filesystem(conn, host),
-                    self._collect_diskstats(conn, host),
-                    self._collect_network(conn, host),
-                    self._collect_vmstat(conn, host),
-                    self._collect_filefd(conn, host),
-                    return_exceptions=True
-                )
-                
-                self.logger.debug(f"Collected metrics from {host}")
+            )
+            self.connections[host] = conn
+            self.logger.info(f"New connection established to {host}")
+            return conn
+    
+    async def collect_from_host(self, host: str):
+        """하나의 호스트에서 모든 메트릭 수집"""
+        # Check if this host is in bad_hosts and if retry interval has passed
+        current_time = time.time()
+        if host in self.bad_hosts:
+            last_attempt = self.bad_hosts[host]
+            time_since_last_attempt = current_time - last_attempt
+            if time_since_last_attempt < self.bad_host_retry_interval:
+                # Skip this host, will retry after interval
+                remaining = self.bad_host_retry_interval - time_since_last_attempt
+                self.logger.debug(f"Skipping bad host {host} (retry in {remaining/60:.1f} minutes)")
+                return
+            else:
+                # Retry interval has passed, remove from bad_hosts and try again
+                self.logger.info(f"Retrying connection to previously failed host {host} (last attempt {time_since_last_attempt/60:.1f} minutes ago)")
+                del self.bad_hosts[host]
         
+        try:
+            # Get or create connection from pool
+            conn = await self._get_connection(host)
+            
+            # 모든 메트릭을 병렬로 수집
+            await asyncio.gather(
+                self._collect_uname(conn, host),
+                self._collect_cpu(conn, host),
+                self._collect_loadavg(conn, host),
+                self._collect_memory(conn, host),
+                self._collect_filesystem(conn, host),
+                self._collect_diskstats(conn, host),
+                self._collect_network(conn, host),
+                self._collect_vmstat(conn, host),
+                self._collect_filefd(conn, host),
+                return_exceptions=True
+            )
+            
+            # Connection successful, remove from bad_hosts if it was there
+            if host in self.bad_hosts:
+                del self.bad_hosts[host]
+                self.logger.info(f"Host {host} recovered, removed from bad hosts list")
+            
+            self.logger.debug(f"Collected metrics from {host}")
+        
+        except (asyncssh.Error, OSError, TimeoutError) as e:
+            # Connection/authentication failed, add to bad_hosts and remove from pool
+            self.bad_hosts[host] = current_time
+            async with self.connection_lock:
+                if host in self.connections:
+                    del self.connections[host]
+            self.logger.warning(f"Failed to collect from {host}: {e} - added to bad hosts list (will retry in 1 hour)")
         except Exception as e:
-            self.logger.error(f"Failed to collect from {host}: {e}")
+            # Other errors, also add to bad_hosts to avoid retrying too soon
+            self.bad_hosts[host] = current_time
+            async with self.connection_lock:
+                if host in self.connections:
+                    del self.connections[host]
+            self.logger.error(f"Failed to collect from {host}: {e} - added to bad hosts list")
+    
+    def update_hosts(self, new_hosts: List[str]):
+        """호스트 목록 동적 업데이트"""
+        if not new_hosts:
+            self.logger.debug("update_hosts called with empty list")
+            return
+        
+        # 중복 제거하며 새 호스트 추가
+        current_hosts = set(self.hosts)
+        new_host_set = set(new_hosts)
+        added_hosts = new_host_set - current_hosts
+        
+        self.logger.info(f"[NODE COLLECTOR] update_hosts called: current={len(current_hosts)}, new={len(new_host_set)}, to_add={len(added_hosts)}")
+        
+        if added_hosts:
+            self.hosts.extend(list(added_hosts))
+            self.logger.warning(f"[NODE COLLECTOR] ✓ Added {len(added_hosts)} new hosts: {sorted(added_hosts)}")
+            self.logger.warning(f"[NODE COLLECTOR] ✓ Total hosts now: {len(self.hosts)} hosts")
+        else:
+            self.logger.info(f"[NODE COLLECTOR] No new hosts to add (all {len(new_host_set)} hosts already tracked)")
     
     async def collect_all(self):
         """모든 호스트에서 메트릭 수집"""
@@ -450,8 +546,13 @@ async def collection_loop(collector: RemoteNodeCollector, interval: int):
     logger = logging.getLogger(__name__)
     logger.info("Starting collection loop")
     
+    iteration = 0
     while True:
         try:
+            iteration += 1
+            host_count = len(collector.hosts)
+            if iteration % 10 == 1:  # Log every 10th iteration
+                logger.info(f"[NODE COLLECTOR] Collecting from {host_count} hosts (iteration {iteration})")
             await collector.collect_all()
         except Exception as e:
             logger.error(f"Collection error: {e}")

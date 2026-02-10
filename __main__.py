@@ -17,6 +17,7 @@ import logging
 import gzip
 from io import BytesIO
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 try:
     import yaml
     YAML_AVAILABLE = True
@@ -25,231 +26,38 @@ except ImportError:
 
 
 def main():
-    """Main entry point with subcommands"""
     parser = argparse.ArgumentParser(
-        description='Remote Exporter - Unified metrics collection tool',
+        description='Remote Prometheus Exporter for Redis, Memcached, Arcus, and Node metrics',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Collect node metrics via SSH
-  %(prog)s node --hosts 192.168.1.10 192.168.1.11 --username root --key-file ~/.ssh/id_rsa
+  # Run exporters from YAML configuration file
+  %(prog)s -c config.yaml
   
-  # Collect arcus/memcached metrics from ZooKeeper
-  %(prog)s arcus --zookeeper-addr localhost:2181 --cloud-name "prod.*"
-  
-  # Collect arcus metrics with node metrics enabled
-  %(prog)s arcus --zookeeper-addr localhost:2181 --enable-node-metrics --ssh-username root
-  
-  # Collect Redis metrics
-  %(prog)s redis --redis-addrs localhost:6379
-  
-  # Collect Redis Cluster metrics with auto-discovery
-  %(prog)s redis --redis-addrs seed1:6379 seed2:6379 --cluster-mode
-  
-  # Run multiple exporters from config file
-  %(prog)s conf --config config.yaml
+  # Run with custom log level
+  %(prog)s -c config.yaml --log-level DEBUG
         """
     )
     
-    # Common arguments
-    parser.add_argument('--exporter-port', type=int, default=9150,
-                       help='Exporter HTTP port (default: 9150)')
-    parser.add_argument('--collect-interval', type=float, default=15.0,
-                       help='Metrics collection interval in seconds (default: 15.0)')
-    parser.add_argument('--max-concurrent', type=int, default=10,
-                       help='Maximum concurrent instance collections (default: 10)')
-    parser.add_argument('--ssh-username', default='root',
-                       help='SSH username for node metrics collection (default: root)')
-    parser.add_argument('--ssh-key-file',
-                       help='SSH private key file path for node metrics collection')
-    parser.add_argument('--ssh-port', type=int, default=22,
-                       help='SSH port for node metrics collection (default: 22)')
-    parser.add_argument('--region',
-                       help='Region label for metrics')
+    # Only keep essential CLI arguments
+    parser.add_argument('-c', '--config', required=True,
+                       help='Path to YAML configuration file')
     parser.add_argument('--log-level', default='INFO',
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Log level (default: INFO)')
     
-    subparsers = parser.add_subparsers(dest='command', help='Available commands')
-    subparsers.required = True
-    
-    # Node exporter subcommand
-    node_parser = subparsers.add_parser('node', 
-                                         help='Remote node metrics collector via SSH')
-    node_parser.add_argument('--hosts', nargs='+', required=True,
-                            help='Remote hosts to monitor')
-    node_parser.add_argument('--username', required=True,
-                            help='SSH username')
-    node_parser.add_argument('--key-file', 
-                            help='SSH private key file')
-    node_parser.add_argument('--ssh-port', type=int, default=22,
-                            help='SSH port (default: 22)')
-    
-    # Arcus exporter subcommand
-    arcus_parser = subparsers.add_parser('arcus',
-                                          help='Arcus cache metrics collector via ZooKeeper')
-    arcus_parser.add_argument('--zookeeper-addr', required=True,
-                             help='ZooKeeper address')
-    arcus_parser.add_argument('--cloud-name', default='.*',
-                             help='Cloud name pattern (regex, default: .* for all clouds)')
-    
-    # Node metrics via SSH for arcus
-    arcus_parser.add_argument('--enable-node-metrics', action='store_true',
-                             help='Enable node metrics collection via SSH (default: False)')
-    arcus_parser.add_argument('--include-k8s-node', action='store_true',
-                             help='Include Kubernetes nodes in node metrics collection (default: False)')
-    
-    # Memcached exporter subcommand
-    memcached_parser = subparsers.add_parser('memcached',
-                                              help='Memcached metrics collector')
-    memcached_parser.add_argument('--memcached-addrs', nargs='+', required=True,
-                                  help='Memcached server addresses in format host:port')
-    
-    # Node metrics via SSH for memcached
-    memcached_parser.add_argument('--enable-node-metrics', action='store_true',
-                                  help='Enable node metrics collection via SSH (default: False)')
-    memcached_parser.add_argument('--include-k8s-node', action='store_true',
-                                  help='Include Kubernetes nodes in node metrics collection (default: False)')
-    
-    # Redis exporter subcommand
-    redis_parser = subparsers.add_parser('redis',
-                                          help='Redis/Redis Cluster metrics collector')
-    redis_parser.add_argument('--redis-addrs', nargs='+', required=True,
-                             help='Redis server addresses in format host:port')
-    redis_parser.add_argument('--redis-password',
-                             help='Redis password')
-    redis_parser.add_argument('--cluster-name',
-                             help='Redis Cluster name (enables cluster mode with automatic node discovery)')
-    redis_parser.add_argument('--cluster-refresh-interval', type=float, default=60.0,
-                             help='Cluster node refresh interval in seconds (default: 60)')
-    
-    # Node metrics via SSH for redis
-    redis_parser.add_argument('--enable-node-metrics', action='store_true',
-                             help='Enable node metrics collection via SSH (default: False)')
-    redis_parser.add_argument('--include-k8s-node', action='store_true',
-                             help='Include Kubernetes nodes in node metrics collection (default: False)')
-    
-    # Conf subcommand - run multiple exporters from YAML config
-    conf_parser = subparsers.add_parser('conf',
-                                         help='Run multiple exporters from YAML configuration file')
-    conf_parser.add_argument('--config', '-c', required=True,
-                            help='Path to YAML configuration file')
-    
     args = parser.parse_args()
     
-    # Setup logging
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    
-    # Route to appropriate handler
-    if args.command == 'node':
-        from node_exporter import run_node_exporter
-        # Convert args to list for node parser
-        node_args = []
-        node_args.extend(['--hosts'] + args.hosts)
-        node_args.extend(['--username', args.username])
-        if args.key_file:
-            node_args.extend(['--key-file', args.key_file])
-        node_args.extend(['--ssh-port', str(args.ssh_port)])
-        node_args.extend(['--exporter-port', str(args.exporter_port)])
-        node_args.extend(['--collect-interval', str(args.collect_interval)])
-        node_args.extend(['--log-level', args.log_level])
-        
-        run_node_exporter(node_args)
-        
-    elif args.command == 'arcus':
-        from arcus_exporter import run_arcus_exporter
-        # Convert args to list for arcus parser
-        arcus_args = []
-        arcus_args.extend(['--zookeeper-addr', args.zookeeper_addr])
-        arcus_args.extend(['--cloud-name', args.cloud_name])
-        arcus_args.extend(['--exporter-port', str(args.exporter_port)])
-        arcus_args.extend(['--collect-interval', str(args.collect_interval)])
-        arcus_args.extend(['--max-concurrent', str(args.max_concurrent)])
-        arcus_args.extend(['--log-level', args.log_level])
-        if args.region:
-            arcus_args.extend(['--region', args.region])
-        # Handle node metrics flags
-        if args.enable_node_metrics:
-            arcus_args.append('--enable-node-metrics')
-        if args.include_k8s_node:
-            arcus_args.append('--include-k8s-node')
-        arcus_args.extend(['--ssh-username', args.ssh_username])
-        if args.ssh_key_file:
-            arcus_args.extend(['--ssh-key-file', args.ssh_key_file])
-        arcus_args.extend(['--ssh-port', str(args.ssh_port)])
-        
-        run_arcus_exporter(arcus_args)
-    
-    elif args.command == 'memcached':
-        from memcached_exporter import run_memcached_exporter
-        # Convert args to list for memcached parser
-        memcached_args = []
-        memcached_args.extend(['--memcached-addrs'] + args.memcached_addrs)
-        memcached_args.extend(['--exporter-port', str(args.exporter_port)])
-        memcached_args.extend(['--collect-interval', str(args.collect_interval)])
-        memcached_args.extend(['--max-concurrent', str(args.max_concurrent)])
-        memcached_args.extend(['--log-level', args.log_level])
-        if args.region:
-            memcached_args.extend(['--region', args.region])
-        # Handle node metrics flags
-        if args.enable_node_metrics:
-            memcached_args.append('--enable-node-metrics')
-        if args.include_k8s_node:
-            memcached_args.append('--include-k8s-node')
-        memcached_args.extend(['--ssh-username', args.ssh_username])
-        if args.ssh_key_file:
-            memcached_args.extend(['--ssh-key-file', args.ssh_key_file])
-        memcached_args.extend(['--ssh-port', str(args.ssh_port)])
-        
-        run_memcached_exporter(memcached_args)
-    
-    elif args.command == 'redis':
-        from redis_exporter import run_redis_exporter
-        # Convert args to list for redis parser
-        redis_args = []
-        redis_args.extend(['--redis-addrs'] + args.redis_addrs)
-        if args.redis_password:
-            redis_args.extend(['--redis-password', args.redis_password])
-        if args.cluster_name:
-            redis_args.extend(['--cluster-name', args.cluster_name])
-        redis_args.extend(['--cluster-refresh-interval', str(args.cluster_refresh_interval)])
-        redis_args.extend(['--exporter-port', str(args.exporter_port)])
-        redis_args.extend(['--collect-interval', str(args.collect_interval)])
-        redis_args.extend(['--log-level', args.log_level])
-        if args.region:
-            redis_args.extend(['--region', args.region])
-        # Handle node metrics flags
-        if args.enable_node_metrics:
-            redis_args.append('--enable-node-metrics')
-        if args.include_k8s_node:
-            redis_args.append('--include-k8s-node')
-        redis_args.extend(['--ssh-username', args.ssh_username])
-        if args.ssh_key_file:
-            redis_args.extend(['--ssh-key-file', args.ssh_key_file])
-        redis_args.extend(['--ssh-port', str(args.ssh_port)])
-        
-        run_redis_exporter(redis_args)
-    
-    elif args.command == 'conf':
-        if not YAML_AVAILABLE:
-            print("Error: PyYAML is not installed. Install it with: pip install pyyaml", file=sys.stderr)
-            sys.exit(1)
-        
-        run_from_config(args.config, args.exporter_port, args.collect_interval, args.max_concurrent,
-                       args.ssh_username, args.ssh_key_file, args.ssh_port, args.region, args.log_level)
-    
-    else:
-        parser.print_help()
+    # Check PyYAML availability
+    if not YAML_AVAILABLE:
+        print("Error: PyYAML is not installed. Install it with: pip install pyyaml", file=sys.stderr)
         sys.exit(1)
+    
+    # Run from config file
+    run_from_config(args.config, args.log_level)
 
 
-def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect_interval: float = None, 
-                     cli_max_concurrent: int = None, cli_ssh_username: str = None, 
-                     cli_ssh_key_file: str = None, cli_ssh_port: int = None, cli_region: str = None, 
-                     log_level: str = 'INFO'):
+def run_from_config(config_file: str, log_level: str = 'INFO'):
     """Run multiple exporters from YAML configuration file with shared registry"""
     logging.basicConfig(
         level=getattr(logging, log_level),
@@ -277,17 +85,18 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
         sys.exit(1)
     
     # Get global settings (CLI arguments override config file)
-    exporter_port = cli_exporter_port if cli_exporter_port is not None else config.get('exporter_port', 9150)
-    collect_interval = cli_collect_interval if cli_collect_interval is not None else config.get('collect_interval', 15.0)
-    max_concurrent = cli_max_concurrent if cli_max_concurrent is not None else config.get('max_concurrent', 10)
+    # Get global settings from config file
+    exporter_port = config.get('exporter_port', 9150)
+    collect_interval = config.get('collect_interval', 15.0)
+    max_concurrent = config.get('max_concurrent', 10)
     
-    # Get SSH settings from CLI or config (CLI takes precedence)
-    ssh_username = cli_ssh_username if cli_ssh_username is not None else config.get('ssh_username', 'root')
-    ssh_key_file = cli_ssh_key_file if cli_ssh_key_file is not None else config.get('ssh_key_file')
-    ssh_port = cli_ssh_port if cli_ssh_port is not None else config.get('ssh_port', 22)
+    # Get SSH settings from config
+    ssh_username = config.get('ssh_username', 'root')
+    ssh_key_file = config.get('ssh_key_file')
+    ssh_port = config.get('ssh_port', 22)
     
-    # Get region from CLI or config
-    region = cli_region if cli_region is not None else config.get('region')
+    # Get region from config
+    region = config.get('region')
     
     logger.info(f"Starting {len(exporters)} exporter(s) from configuration")
     logger.info(f"Shared settings - port: {exporter_port}, interval: {collect_interval}s, max_concurrent: {max_concurrent}, region: {region}")
@@ -305,8 +114,39 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
     def update_metrics_cache():
         """Background task to update metrics cache"""
         logger.info("Starting background metrics cache updater")
+        
+        # Do initial update immediately
+        try:
+            logger.info("Performing initial metrics cache update...")
+            metrics_data = generate_latest(shared_registry)
+            
+            # Compress data
+            compressed = BytesIO()
+            with gzip.GzipFile(fileobj=compressed, mode='wb', compresslevel=6) as f:
+                f.write(metrics_data)
+            compressed_data = compressed.getvalue()
+            
+            # Update cache
+            with metrics_cache['lock']:
+                metrics_cache['data'] = metrics_data
+                metrics_cache['compressed'] = compressed_data
+                metrics_cache['timestamp'] = time.time()
+            
+            if len(metrics_data) > 0:
+                ratio = 100 * len(compressed_data) / len(metrics_data)
+                logger.info(f"Initial metrics cache ready: {len(metrics_data)} bytes raw, {len(compressed_data)} bytes compressed ({ratio:.1f}% ratio)")
+            else:
+                logger.warning(f"Initial metrics cache is empty - no metrics registered yet")
+        except Exception as e:
+            logger.error(f"Error in initial metrics cache update: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+        
+        # Continue with periodic updates
         while True:
             try:
+                time.sleep(cache_ttl)
+                
                 # Generate metrics
                 metrics_data = generate_latest(shared_registry)
                 
@@ -322,12 +162,22 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
                     metrics_cache['compressed'] = compressed_data
                     metrics_cache['timestamp'] = time.time()
                 
-                logger.debug(f"Metrics cache updated: {len(metrics_data)} bytes raw, {len(compressed_data)} bytes compressed ({100*len(compressed_data)/len(metrics_data):.1f}% ratio)")
+                # Calculate compression ratio, handle empty metrics
+                if len(metrics_data) > 0:
+                    ratio = 100 * len(compressed_data) / len(metrics_data)
+                    logger.debug(f"Metrics cache updated: {len(metrics_data)} bytes raw, {len(compressed_data)} bytes compressed ({ratio:.1f}% ratio)")
+                else:
+                    logger.debug(f"Metrics cache updated: empty metrics")
                 
             except Exception as e:
                 logger.error(f"Error updating metrics cache: {e}")
-            
-            time.sleep(cache_ttl)
+                import traceback
+                logger.error(traceback.format_exc())
+    
+    class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+        """HTTP Server with threading support for concurrent requests"""
+        daemon_threads = True
+        allow_reuse_address = True
     
     class CachedMetricsHandler(BaseHTTPRequestHandler):
         """HTTP handler with pre-cached and compressed metrics"""
@@ -366,15 +216,42 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
                             self.end_headers()
                             self.wfile.write(b'Metrics cache initializing, please retry in a few seconds\n')
                 
+                except (BrokenPipeError, ConnectionResetError):
+                    # Client disconnected, ignore silently
+                    pass
                 except Exception as e:
-                    logger.error(f"Error serving metrics: {e}")
-                    self.send_error(500, f"Internal Server Error: {e}")
+                    try:
+                        logger.error(f"Error serving metrics: {e}")
+                        self.send_error(500, f"Internal Server Error: {e}")
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+            elif self.path == '/':
+                # Root path - show simple info page
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/html')
+                    self.end_headers()
+                    html = b"""<!DOCTYPE html>
+<html>
+<head><title>Remote Exporter</title></head>
+<body>
+<h1>Remote Exporter</h1>
+<p>Prometheus exporter for Redis, Memcached, Arcus, and Node metrics.</p>
+<p><a href="/metrics">View Metrics</a></p>
+</body>
+</html>"""
+                    self.wfile.write(html)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             else:
-                self.send_error(404, "Not Found")
+                try:
+                    self.send_error(404, "Not Found")
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
     
     # Collect all unique hosts for node metrics across all exporters
     all_hosts = set()
-    include_k8s_node = False
+    has_node_metrics_enabled = False  # Track if any exporter has node metrics enabled
     
     # Parse exporters and collect host information
     exporter_instances = []
@@ -385,66 +262,69 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
         
         exporter_type = exporter_config['type']
         
-        # Collect hosts if node metrics enabled
-        if exporter_config.get('enable_node_metrics', False):
-            if exporter_type == 'arcus' and 'memcached_addrs' in exporter_config:
+        # Node exporter always collects node metrics
+        if exporter_type == 'node':
+            has_node_metrics_enabled = True
+            if 'hosts' in exporter_config:
+                all_hosts.update(exporter_config['hosts'])
+                logger.info(f"Node exporter #{idx}: added {len(exporter_config['hosts'])} hosts")
+            else:
+                logger.warning(f"Node exporter #{idx} has no 'hosts' field")
+        
+        # Collect hosts if node metrics enabled for other exporter types
+        elif exporter_config.get('enable_node_metrics', False):
+            has_node_metrics_enabled = True
+            logger.info(f"Exporter {exporter_type} #{idx} has enable_node_metrics=True")
+            if exporter_type == 'arcus':
+                # For Arcus, check memcached_addrs or hosts field
+                if 'memcached_addrs' in exporter_config:
+                    for addr in exporter_config['memcached_addrs']:
+                        host = addr.split(':')[0]
+                        all_hosts.add(host)
+                        logger.debug(f"Added host from arcus memcached_addrs: {host}")
+                elif 'hosts' in exporter_config:
+                    all_hosts.update(exporter_config['hosts'])
+                    logger.debug(f"Added hosts from arcus hosts field: {exporter_config['hosts']}")
+                else:
+                    logger.warning(f"Arcus exporter has enable_node_metrics=True but no 'memcached_addrs' or 'hosts' field - hosts will be discovered from ZooKeeper at runtime")
+            elif exporter_type == 'memcached' and 'memcached_addrs' in exporter_config:
                 for addr in exporter_config['memcached_addrs']:
                     host = addr.split(':')[0]
                     all_hosts.add(host)
+                    logger.debug(f"Added host from memcached: {host}")
             elif exporter_type == 'redis' and 'redis_addrs' in exporter_config:
                 for addr in exporter_config['redis_addrs']:
                     host = addr.split(':')[0]
                     all_hosts.add(host)
-            elif exporter_type == 'node' and 'hosts' in exporter_config:
-                all_hosts.update(exporter_config['hosts'])
-            
-            # Check if any exporter wants to include K8s nodes
-            if exporter_config.get('include_k8s_node', False):
-                include_k8s_node = True
+                    logger.debug(f"Added host from redis: {host}")
         
         exporter_instances.append((exporter_type, exporter_config, idx))
     
-    # Create shared node collector if we have hosts
+    logger.info(f"Collected {len(all_hosts)} unique hosts for node metrics: {all_hosts}")
+    
+    # Create shared node collector if node metrics are enabled
+    # Even if all_hosts is empty initially (e.g., Arcus with ZooKeeper discovery),
+    # we still need to create the collector so it can be updated dynamically
+    # If ssh_key_file is None, asyncssh will use default keys (~/.ssh/id_rsa, etc.)
     shared_node_collector = None
-    if all_hosts and ssh_key_file:
-        logger.info(f"Creating shared node collector for {len(all_hosts)} unique hosts")
+    if has_node_metrics_enabled:
+        logger.info(f"Creating shared node collector (initial hosts: {len(all_hosts)})")
         from node_exporter import RemoteNodeCollector
-        from redis_exporter import is_k8s_node
-        import asyncio
         
-        # Filter K8s nodes if needed (exclude by default unless include_k8s_node is True)
-        if not include_k8s_node:
-            async def filter_k8s_nodes():
-                filtered = set()
-                for host in all_hosts:
-                    is_k8s = await is_k8s_node(
-                        host,
-                        ssh_username,
-                        ssh_key_file,
-                        ssh_port
-                    )
-                    if not is_k8s:
-                        filtered.add(host)
-                    else:
-                        logger.info(f"Excluding K8s node: {host}")
-                return filtered
-            
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            all_hosts = loop.run_until_complete(filter_k8s_nodes())
-            loop.close()
-        
-        if all_hosts:
-            shared_node_collector = RemoteNodeCollector(
-                hosts=list(all_hosts),
-                username=ssh_username,
-                key_file=ssh_key_file,
-                port=ssh_port
-            )
-            shared_node_collector.registry = shared_registry
-            logger.info(f"Shared node collector created for {len(all_hosts)} hosts")
-    elif all_hosts and not ssh_key_file:
-        logger.warning(f"Found {len(all_hosts)} hosts but no SSH key file specified - node metrics disabled")
+        # Create collector with all hosts (no K8s filtering)
+        shared_node_collector = RemoteNodeCollector(
+            hosts=list(all_hosts),
+            username=ssh_username,
+            key_file=ssh_key_file,
+            port=ssh_port,
+            registry=shared_registry  # Use shared registry from the start
+        )
+        if ssh_key_file:
+            logger.warning(f"[SHARED NODE] Shared node collector created (initial hosts: {len(all_hosts)}, username: {ssh_username}, ssh_key: {ssh_key_file})")
+        else:
+            logger.warning(f"[SHARED NODE] Shared node collector created (initial hosts: {len(all_hosts)}, username: {ssh_username}, using default SSH keys from ~/.ssh/)")
+    else:
+        logger.info(f"[SHARED NODE] Node metrics not enabled (has_node_metrics_enabled={has_node_metrics_enabled})")
     
     # Track which exporter types have already initialized metrics
     initialized_types = set()
@@ -455,7 +335,7 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
     for exporter_type, exporter_config, idx in exporter_instances:
         thread = threading.Thread(
             target=run_exporter_from_config,
-            args=(exporter_type, exporter_config, log_level, shared_registry, shared_node_collector, exporter_port, collect_interval, max_concurrent, region, initialized_types, initialized_types_lock),
+            args=(exporter_type, exporter_config, log_level, shared_registry, shared_node_collector, exporter_port, collect_interval, max_concurrent, region, ssh_username, ssh_key_file, ssh_port, initialized_types, initialized_types_lock),
             daemon=True,
             name=f"{exporter_type}-exporter-{idx}"
         )
@@ -467,6 +347,32 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
         logger.error("No valid exporters configured")
         sys.exit(1)
     
+    # Start shared node collector background task if it exists
+    if shared_node_collector:
+        def node_collection_worker():
+            """Background task to collect node metrics"""
+            logger.info("Starting shared node collector background task")
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
+            async def collection_loop():
+                while True:
+                    try:
+                        await shared_node_collector.collect_all()
+                    except Exception as e:
+                        logger.error(f"Node collection error: {e}")
+                    await asyncio.sleep(collect_interval)
+            
+            try:
+                loop.run_until_complete(collection_loop())
+            finally:
+                loop.close()
+        
+        node_thread = threading.Thread(target=node_collection_worker, daemon=True, name='shared-node-collector')
+        node_thread.start()
+        logger.info(f"Started shared node collector (interval: {collect_interval}s, hosts: {len(all_hosts)})")
+    
     # Start background metrics cache updater
     cache_updater_thread = threading.Thread(target=update_metrics_cache, daemon=True, name='cache-updater')
     cache_updater_thread.start()
@@ -475,11 +381,11 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
     # Wait a moment for initial cache to be ready
     time.sleep(2)
     
-    # Start shared HTTP server with caching and compression
-    server = HTTPServer(('', exporter_port), CachedMetricsHandler)
+    # Start shared HTTP server with threading support for concurrent requests
+    server = ThreadedHTTPServer(('', exporter_port), CachedMetricsHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True, name='http-server')
     server_thread.start()
-    logger.info(f"Shared exporter HTTP server started on port {exporter_port} (pre-cached with gzip compression)")
+    logger.info(f"Shared exporter HTTP server started on port {exporter_port} (threaded, pre-cached with gzip compression)")
     logger.info(f"All {len(threads)} exporter(s) running. Press Ctrl+C to stop.")
     
     try:
@@ -493,6 +399,7 @@ def run_from_config(config_file: str, cli_exporter_port: int = None, cli_collect
 def run_exporter_from_config(exporter_type: str, config: dict, log_level: str, 
                               shared_registry, shared_node_collector, 
                               exporter_port: int, collect_interval: float, max_concurrent: int, region: str = None,
+                              ssh_username: str = 'root', ssh_key_file: str = None, ssh_port: int = 22,
                               initialized_types: set = None, initialized_types_lock = None):
     """Run a single exporter with shared registry and node collector"""
     logger = logging.getLogger(f"{exporter_type}_exporter")
@@ -543,6 +450,8 @@ def run_exporter_from_config(exporter_type: str, config: dict, log_level: str,
             # Create metric factory with shared registry
             metric_factory = MetricFactory(registry=shared_registry, default_labels=default_labels)
             
+            logger.warning(f"[MAIN] Creating Arcus exporter with shared_node_collector = {shared_node_collector}, type = {type(shared_node_collector)}")
+            
             exporter = ArcusPrometheusExporter(
                 zookeeper_addr=config.get('zookeeper_addr'),
                 cloud_name=config.get('cloud_name', '.*'),
@@ -552,15 +461,19 @@ def run_exporter_from_config(exporter_type: str, config: dict, log_level: str,
                 max_concurrent=max_concurrent,
                 enable_node_metrics=False,  # Disabled, using shared collector
                 exclude_k8s_node=True,
-                ssh_username=config.get('ssh_username', 'root'),
-                ssh_key_file=config.get('ssh_key_file'),
-                ssh_port=config.get('ssh_port', 22)
+                ssh_username=ssh_username,  # Use global SSH username
+                ssh_key_file=ssh_key_file,  # Use global SSH key file
+                ssh_port=ssh_port,  # Use global SSH port
+                shared_node_collector=shared_node_collector  # Pass shared node collector
             )
+            
+            logger.warning(f"[MAIN] After creation, exporter.shared_node_collector = {exporter.shared_node_collector}")
             
             # Replace registry with shared one
             exporter.registry = shared_registry
             exporter.metric_factory = metric_factory
             exporter.node_collector = shared_node_collector
+            exporter.shared_node_collector = shared_node_collector  # Ensure it's set after registry replacement
             
             # Initialize metrics with shared registry
             exporter._init_metrics()
@@ -592,9 +505,9 @@ def run_exporter_from_config(exporter_type: str, config: dict, log_level: str,
                 max_concurrent=max_concurrent,
                 enable_node_metrics=False,  # Disabled, using shared collector
                 exclude_k8s_node=True,
-                ssh_username=config.get('ssh_username', 'root'),
-                ssh_key_file=config.get('ssh_key_file'),
-                ssh_port=config.get('ssh_port', 22)
+                ssh_username=ssh_username,  # Use global SSH username
+                ssh_key_file=ssh_key_file,  # Use global SSH key file
+                ssh_port=ssh_port  # Use global SSH port
             )
             
             # Replace registry with shared one
@@ -634,9 +547,9 @@ def run_exporter_from_config(exporter_type: str, config: dict, log_level: str,
                 default_labels=default_labels,
                 enable_node_metrics=False,  # Disabled, using shared collector
                 exclude_k8s_node=True,
-                ssh_username=config.get('ssh_username', 'root'),
-                ssh_key_file=config.get('ssh_key_file'),
-                ssh_port=config.get('ssh_port', 22)
+                ssh_username=ssh_username,  # Use global SSH username
+                ssh_key_file=ssh_key_file,  # Use global SSH key file
+                ssh_port=ssh_port  # Use global SSH port
             )
             
             # Replace registry with shared one
