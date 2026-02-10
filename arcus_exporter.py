@@ -511,11 +511,17 @@ class ArcusPrometheusExporter(MemcachedPrometheusExporter):
                 cache_list_path = f"{cache_list_base}/{cloud}"
                 try:
                     children = self.zk_client.get_children(cache_list_path)
+                    self.logger.info(f"Found {len(children)} nodes in {cache_list_path}")
                     for child in children:
                         try:
+                            # Node format: IP:PORT-HOSTNAME
+                            # Example: 10.173.203.44:11211-arcus001.cache.nhncorp.com
                             addr, hosts = child.split('-', 1)
                             all_instances.append(addr)
                             cloud_map[addr] = cloud  # Store cloud mapping
+                            # Log first few instances for debugging
+                            if len(all_instances) <= 3:
+                                self.logger.info(f"Parsed ZK node '{child}' -> addr='{addr}', host='{hosts}', cloud='{cloud}'")
                         except Exception as e:
                             self.logger.warning(f"Failed to process node {child}: {e}")
                             continue

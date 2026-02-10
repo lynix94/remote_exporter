@@ -183,23 +183,75 @@ class RemoteNodeCollector:
                                         'Maximum file descriptors',
                                         ['host'], registry=self.registry)
     
-    async def _run_command(self, conn, command: str) -> Optional[str]:
+    async def _run_command(self, conn, command: str, timeout: int = None) -> Optional[str]:
         """원격 명령 실행"""
         try:
             result = await asyncio.wait_for(
                 conn.run(command, check=False),
-                timeout=self.timeout
+                timeout=timeout or self.timeout
             )
             if result.exit_status == 0:
                 return result.stdout
             return None
         except Exception as e:
             self.logger.debug(f"Command failed: {command}: {e}")
-            return None
-    
-    async def _collect_uname(self, conn, host: str):
-        """시스템 정보 수집"""
-        output = await self._run_command(conn, 'uname -a')
+            return None    
+    async def _collect_all_metrics(self, conn, host: str):
+        """모든 메트릭을 한 번의 SSH 호출로 수집"""
+        # Combine all commands with delimiters
+        command = """
+echo "===UNAME==="; uname -a
+echo "===LOADAVG==="; cat /proc/loadavg
+echo "===MEMINFO==="; cat /proc/meminfo
+echo "===STAT==="; cat /proc/stat
+echo "===DISKSTATS==="; cat /proc/diskstats
+echo "===NETDEV==="; cat /proc/net/dev
+echo "===FILEFD==="; cat /proc/sys/fs/file-nr
+echo "===DF==="; df -B1 -T
+echo "===DFI==="; df -i
+"""
+        output = await self._run_command(conn, command.strip(), timeout=10)
+        if not output:
+            return
+        
+        # Split output by delimiters
+        sections = {}
+        current_section = None
+        current_data = []
+        
+        for line in output.split('\n'):
+            if line.startswith('===') and line.endswith('==='):
+                if current_section:
+                    sections[current_section] = '\n'.join(current_data)
+                current_section = line.strip('=')
+                current_data = []
+            else:
+                current_data.append(line)
+        
+        if current_section:
+            sections[current_section] = '\n'.join(current_data)
+        
+        # Parse each section
+        if 'UNAME' in sections:
+            self._parse_uname(sections['UNAME'], host)
+        if 'LOADAVG' in sections:
+            self._parse_loadavg(sections['LOADAVG'], host)
+        if 'MEMINFO' in sections:
+            self._parse_meminfo(sections['MEMINFO'], host)
+        if 'STAT' in sections:
+            self._parse_stat(sections['STAT'], host)
+            # STAT 섹션에서 vmstat 데이터도 파싱 (ctxt, processes, procs_running 등)
+            self._parse_vmstat(sections['STAT'], host)
+        if 'DISKSTATS' in sections:
+            self._parse_diskstats(sections['DISKSTATS'], host)
+        if 'NETDEV' in sections:
+            self._parse_netdev(sections['NETDEV'], host)
+        if 'FILEFD' in sections:
+            self._parse_filefd(sections['FILEFD'], host)
+        if 'DF' in sections and 'DFI' in sections:
+            self._parse_filesystem(sections['DF'], sections['DFI'], host)    
+    def _parse_uname(self, output: str, host: str):
+        """시스템 정보 파싱"""
         if output:
             parts = output.strip().split()
             self.node_uname_info.labels(host=host).info({
@@ -210,9 +262,8 @@ class RemoteNodeCollector:
                 'nodename': parts[1] if len(parts) > 1 else host
             })
     
-    async def _collect_cpu(self, conn, host: str):
-        """CPU 메트릭 수집"""
-        output = await self._run_command(conn, 'cat /proc/stat')
+    def _parse_stat(self, output: str, host: str):
+        """CPU 및 시스템 통계 파싱"""
         if not output:
             return
         
@@ -232,18 +283,16 @@ class RemoteNodeCollector:
                         host=host, cpu=cpu_name, mode=mode
                     )._value._value = value / 100.0
     
-    async def _collect_loadavg(self, conn, host: str):
-        """Load average 수집"""
-        output = await self._run_command(conn, 'cat /proc/loadavg')
+    def _parse_loadavg(self, output: str, host: str):
+        """Load average 파싱"""
         if output:
             loads = output.strip().split()[:3]
             self.node_load1.labels(host=host).set(float(loads[0]))
             self.node_load5.labels(host=host).set(float(loads[1]))
             self.node_load15.labels(host=host).set(float(loads[2]))
     
-    async def _collect_memory(self, conn, host: str):
-        """메모리 메트릭 수집"""
-        output = await self._run_command(conn, 'cat /proc/meminfo')
+    def _parse_meminfo(self, output: str, host: str):
+        """메모리 메트릭 파싱"""
         if not output:
             return
         
@@ -264,38 +313,34 @@ class RemoteNodeCollector:
                 if key in mem_metrics:
                     mem_metrics[key].labels(host=host).set(int(value_kb) * 1024)
     
-    async def _collect_filesystem(self, conn, host: str):
-        """파일시스템 메트릭 수집"""
+    def _parse_filesystem(self, df_output: str, dfi_output: str, host: str):
+        """파일시스템 메트릭 파싱"""
         # df with all information
-        output = await self._run_command(conn, 'df -B1 -T')
-        if not output:
-            return
-        
-        for line in output.strip().split('\n')[1:]:
-            parts = line.split()
-            if len(parts) >= 7:
-                device = parts[0]
-                fstype = parts[1]
-                size = int(parts[2])
-                used = int(parts[3])
-                avail = int(parts[4])
-                mountpoint = parts[6]
-                
-                # Skip special filesystems
-                if fstype in ['tmpfs', 'devtmpfs', 'devfs', 'proc', 'sysfs']:
-                    continue
-                
-                self.node_filesystem_size_bytes.labels(
-                    host=host, device=device, mountpoint=mountpoint, fstype=fstype
-                ).set(size)
-                self.node_filesystem_avail_bytes.labels(
-                    host=host, device=device, mountpoint=mountpoint, fstype=fstype
-                ).set(avail)
+        if df_output:
+            for line in df_output.strip().split('\n')[1:]:
+                parts = line.split()
+                if len(parts) >= 7:
+                    device = parts[0]
+                    fstype = parts[1]
+                    size = int(parts[2])
+                    used = int(parts[3])
+                    avail = int(parts[4])
+                    mountpoint = parts[6]
+                    
+                    # Skip special filesystems
+                    if fstype in ['tmpfs', 'devtmpfs', 'devfs', 'proc', 'sysfs']:
+                        continue
+                    
+                    self.node_filesystem_size_bytes.labels(
+                        host=host, device=device, mountpoint=mountpoint, fstype=fstype
+                    ).set(size)
+                    self.node_filesystem_avail_bytes.labels(
+                        host=host, device=device, mountpoint=mountpoint, fstype=fstype
+                    ).set(avail)
         
         # Inode information
-        output = await self._run_command(conn, 'df -i')
-        if output:
-            for line in output.strip().split('\n')[1:]:
+        if dfi_output:
+            for line in dfi_output.strip().split('\n')[1:]:
                 parts = line.split()
                 if len(parts) >= 6:
                     device = parts[0]
@@ -311,9 +356,8 @@ class RemoteNodeCollector:
                             host=host, device=device, mountpoint=mountpoint, fstype=''
                         ).set(int(ifree))
     
-    async def _collect_diskstats(self, conn, host: str):
-        """디스크 I/O 통계 수집"""
-        output = await self._run_command(conn, 'cat /proc/diskstats')
+    def _parse_diskstats(self, output: str, host: str):
+        """디스크 I/O 통계 파싱"""
         if not output:
             return
         
@@ -346,9 +390,8 @@ class RemoteNodeCollector:
                     host=host, device=device
                 )._value._value = sectors_written * 512
     
-    async def _collect_network(self, conn, host: str):
-        """네트워크 통계 수집"""
-        output = await self._run_command(conn, 'cat /proc/net/dev')
+    def _parse_netdev(self, output: str, host: str):
+        """네트워크 통계 파싱"""
         if not output:
             return
         
@@ -392,9 +435,8 @@ class RemoteNodeCollector:
                     host=host, device=device
                 )._value._value = tx_errs
     
-    async def _collect_vmstat(self, conn, host: str):
-        """시스템 통계 수집"""
-        output = await self._run_command(conn, 'cat /proc/stat')
+    def _parse_vmstat(self, output: str, host: str):
+        """시스템 통계 파싱 (실제로는 /proc/stat 데이터)"""
         if not output:
             return
         
@@ -415,9 +457,8 @@ class RemoteNodeCollector:
                 btime = int(line.split()[1])
                 self.node_boot_time_seconds.labels(host=host).set(btime)
     
-    async def _collect_filefd(self, conn, host: str):
-        """파일 디스크립터 통계 수집"""
-        output = await self._run_command(conn, 'cat /proc/sys/fs/file-nr')
+    def _parse_filefd(self, output: str, host: str):
+        """파일 디스크립터 통계 파싱"""
         if output:
             parts = output.strip().split()
             if len(parts) >= 3:
@@ -498,19 +539,8 @@ class RemoteNodeCollector:
             # Get or create connection from pool
             conn = await self._get_connection(host)
             
-            # 모든 메트릭을 병렬로 수집
-            await asyncio.gather(
-                self._collect_uname(conn, host),
-                self._collect_cpu(conn, host),
-                self._collect_loadavg(conn, host),
-                self._collect_memory(conn, host),
-                self._collect_filesystem(conn, host),
-                self._collect_diskstats(conn, host),
-                self._collect_network(conn, host),
-                self._collect_vmstat(conn, host),
-                self._collect_filefd(conn, host),
-                return_exceptions=True
-            )
+            # Collect all metrics in one SSH call for efficiency
+            await self._collect_all_metrics(conn, host)
             
             # Connection successful, remove from bad_hosts if it was there
             if host in self.bad_hosts:
