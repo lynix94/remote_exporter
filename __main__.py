@@ -321,11 +321,14 @@ def run_from_config(config_file: str, log_level: str = 'INFO'):
             asyncio.set_event_loop(loop)
             
             async def collection_loop():
+                iteration = 0
                 while True:
                     try:
+                        iteration += 1
+                        logger.info(f"[Node Collector] Starting collection iteration #{iteration}")
                         await shared_node_collector.collect_all()
                     except Exception as e:
-                        logger.error(f"Node collection error: {e}")
+                        logger.error(f"Node collection error: {e}", exc_info=True)
                     await asyncio.sleep(collect_interval)
             
             try:

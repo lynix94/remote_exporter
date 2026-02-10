@@ -40,11 +40,17 @@ class RemoteNodeCollector:
         
         # SSH connection pool: {host: connection}
         self.connections = {}
-        # Use threading.Lock instead of asyncio.Lock to avoid event loop binding issues
-        import threading
-        self.connection_lock = threading.Lock()
+        # Lock will be created lazily per event loop
+        self._connection_lock = None
         
         self._init_metrics()
+    
+    def _get_lock(self):
+        """Get or create lock for current event loop"""
+        # Create lock lazily to avoid event loop binding issues
+        if self._connection_lock is None:
+            self._connection_lock = asyncio.Lock()
+        return self._connection_lock
     
     def _init_metrics(self):
         """메트릭 초기화 - node_exporter 호환"""
@@ -421,7 +427,7 @@ class RemoteNodeCollector:
     async def _get_connection(self, host: str):
         """Get or create SSH connection from pool"""
         # First, check if we have an existing connection (with lock)
-        with self.connection_lock:
+        async with self._get_lock():
             if host in self.connections:
                 conn = self.connections[host]
                 # Test if connection is still alive
@@ -454,7 +460,7 @@ class RemoteNodeCollector:
         )
         
         # Add to pool (with lock)
-        with self.connection_lock:
+        async with self._get_lock():
             # Double-check in case another task created connection while we were connecting
             if host in self.connections:
                 # Another task already connected, close ours and use existing
@@ -517,7 +523,7 @@ class RemoteNodeCollector:
         except (asyncssh.Error, OSError, TimeoutError) as e:
             # SSH connection failed - add to bad_hosts (network/firewall issue)
             self.bad_hosts[host] = current_time
-            with self.connection_lock:
+            async with self._get_lock():
                 if host in self.connections:
                     del self.connections[host]
             # Only log first few failures to avoid log spam
@@ -527,7 +533,7 @@ class RemoteNodeCollector:
         except Exception as e:
             # Other errors during metric collection - DO NOT add to bad_hosts
             # These are usually transient errors, connection is still valid
-            with self.connection_lock:
+            async with self._get_lock():
                 if host in self.connections:
                     # Keep connection alive for next attempt
                     pass
@@ -579,20 +585,22 @@ class RemoteNodeCollector:
         exception_tuples = [r for r in results if isinstance(r, tuple) and len(r) == 3 and r[0] == 'exception']
         exception_count = len(exception_tuples)
         
-        # Log summary
-        if failed_count > 0 or error_count > 0 or exception_count > 0:
-            msg = f"Collected from {success_count}/{total_hosts} hosts in {elapsed:.2f}s"
-            if skipped_count > 0:
-                msg += f" (skipped: {skipped_count})"
-            if failed_count > 0:
-                msg += f" (conn failed: {failed_count})"
-            if error_count > 0:
-                msg += f" (errors: {error_count})"
-            if exception_count > 0:
-                msg += f" (exceptions: {exception_count})"
-            self.logger.info(msg)
-        else:
-            self.logger.info(f"Collected metrics from {total_hosts} node hosts in {elapsed:.2f}s")
+        # Always log summary
+        msg = f"Collected from {success_count}/{total_hosts} hosts in {elapsed:.2f}s"
+        details = []
+        if skipped_count > 0:
+            details.append(f"skipped: {skipped_count}")
+        if failed_count > 0:
+            details.append(f"conn failed: {failed_count}")
+        if error_count > 0:
+            details.append(f"errors: {error_count}")
+        if exception_count > 0:
+            details.append(f"exceptions: {exception_count}")
+        
+        if details:
+            msg += f" ({', '.join(details)})"
+        
+        self.logger.info(msg)
         
         # Log detailed exception information (already logged in collect_from_host, just show summary)
         if exception_count > 0:
