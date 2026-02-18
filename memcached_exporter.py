@@ -41,17 +41,20 @@ ONE_LINE_COMMANDS = {
 class MemcachedClient:
     """Simple memcached client for collecting statistics with connection pooling"""
     
-    def __init__(self, host: str = 'localhost', port: int = 11211, timeout: float = 5.0):
+    def __init__(self, host: str = 'localhost', port: int = 11211, timeout: float = 10.0, max_retries: int = 2):
         self.host = host
         self.port = port
         self.timeout = timeout
+        self.max_retries = max_retries
         self.logger = logging.getLogger(__name__)
         self._reader = None
         self._writer = None
         self._connection_lock = asyncio.Lock()
+        self._last_error_time = None
+        self._consecutive_failures = 0
     
     async def _ensure_connection(self):
-        """Ensure connection is established and healthy"""
+        """Ensure connection is established and healthy with retry logic"""
         async with self._connection_lock:
             # Check if connection exists and is open
             if self._writer and not self._writer.is_closing():
@@ -65,20 +68,51 @@ class MemcachedClient:
                 except:
                     pass
             
-            # Create new connection
-            try:
-                self._reader, self._writer = await asyncio.wait_for(
-                    asyncio.open_connection(self.host, self.port),
-                    timeout=self.timeout
-                )
-                # Send ping to verify
-                self._writer.write(b'ping\r\n')
-                await self._writer.drain()
-                data = await asyncio.wait_for(self._reader.read(4096), timeout=self.timeout)
-                return self._reader, self._writer
-            except Exception as e:
-                self.logger.error(f"Failed to connect to {self.host}:{self.port}: {e}")
-                raise
+            # Create new connection with retries
+            last_exception = None
+            for attempt in range(self.max_retries):
+                try:
+                    # Add exponential backoff between retries
+                    if attempt > 0:
+                        backoff_time = min(2 ** (attempt - 1), 5)  # Max 5 seconds
+                        await asyncio.sleep(backoff_time)
+                        self.logger.debug(f"Retry {attempt + 1}/{self.max_retries} connecting to {self.host}:{self.port}")
+                    
+                    self._reader, self._writer = await asyncio.wait_for(
+                        asyncio.open_connection(self.host, self.port),
+                        timeout=self.timeout
+                    )
+                    # Send ping to verify
+                    self._writer.write(b'ping\r\n')
+                    await self._writer.drain()
+                    data = await asyncio.wait_for(self._reader.read(4096), timeout=self.timeout)
+                    
+                    # Reset failure counter on success
+                    self._consecutive_failures = 0
+                    self._last_error_time = None
+                    return self._reader, self._writer
+                    
+                except asyncio.TimeoutError as e:
+                    last_exception = e
+                    self.logger.warning(f"Timeout connecting to {self.host}:{self.port} (attempt {attempt + 1}/{self.max_retries})")
+                except ConnectionRefusedError as e:
+                    last_exception = e
+                    self.logger.warning(f"Connection refused to {self.host}:{self.port} (attempt {attempt + 1}/{self.max_retries})")
+                except Exception as e:
+                    last_exception = e
+                    self.logger.warning(f"Failed to connect to {self.host}:{self.port}: {e} (attempt {attempt + 1}/{self.max_retries})")
+            
+            # All retries failed
+            self._consecutive_failures += 1
+            self._last_error_time = time.time()
+            
+            # Only log ERROR on multiple consecutive failures to reduce log spam
+            if self._consecutive_failures >= 3:
+                self.logger.error(f"Failed to connect to {self.host}:{self.port} after {self.max_retries} retries: {last_exception} (consecutive failures: {self._consecutive_failures})")
+            else:
+                self.logger.warning(f"Failed to connect to {self.host}:{self.port} after {self.max_retries} retries: {last_exception}")
+            
+            raise last_exception
     
     async def _send_command(self, command: str, retry: bool = True) -> str:
         """Send a command to memcached and return the response"""
@@ -164,6 +198,16 @@ class MemcachedClient:
     
     async def is_alive(self) -> bool:
         """Check if memcached server is alive"""
+        # Skip check if recently failed multiple times
+        if self._consecutive_failures >= 5:
+            # Wait at least 60 seconds before retrying a repeatedly failing host
+            if self._last_error_time and (time.time() - self._last_error_time) < 60:
+                self.logger.debug(f"Skipping {self.host}:{self.port} due to recent failures")
+                return False
+            else:
+                # Reset counter after cooldown period
+                self._consecutive_failures = 0
+        
         try:
             response = await self._send_command("version")
             return "VERSION" in response
@@ -276,6 +320,8 @@ class MemcachedPrometheusExporter:
         # Determine labelnames based on whether cloud label is needed
         base_labels = ['address', 'cloud', 'zookeeper'] if self.use_cloud_label else ['address']
         command_labels = ['address', 'command', 'cloud', 'zookeeper'] if self.use_cloud_label else ['address', 'command']
+        
+        self.logger.info(f"Initializing metrics with use_cloud_label={self.use_cloud_label}, base_labels={base_labels}, command_labels={command_labels}")
         
         try:
             # Server info
@@ -449,24 +495,28 @@ class MemcachedPrometheusExporter:
                             self.memcached_bytes = GaugeWrapper(collector, self.metric_factory.default_labels)
                         elif metric_name == 'memcached_current_items':
                             self.memcached_current_items = GaugeWrapper(collector, self.metric_factory.default_labels)
-                        elif metric_name == 'memcached_total_items':
+                        elif metric_name == 'memcached_total_items_total':
                             self.memcached_total_items = GaugeWrapper(collector, self.metric_factory.default_labels)
                         elif metric_name == 'memcached_evictions_total':
-                            self.memcached_evictions = GaugeWrapper(collector, self.metric_factory.default_labels)
+                            self.memcached_evictions_total = GaugeWrapper(collector, self.metric_factory.default_labels)
                         elif metric_name == 'memcached_commands_total':
-                            self.memcached_commands = CounterWrapper(collector, self.metric_factory.default_labels)
-                        elif metric_name == 'memcached_items_evicted_time_seconds':
-                            self.memcached_evicted_time = GaugeWrapper(collector, self.metric_factory.default_labels)
-                        elif metric_name == 'memcached_items_evicted_nonzero_total':
-                            self.memcached_evicted_nonzero = GaugeWrapper(collector, self.metric_factory.default_labels)
-                        elif metric_name == 'memcached_items_evicted_unfetched_total':
-                            self.memcached_evicted_unfetched = GaugeWrapper(collector, self.metric_factory.default_labels)
-                        elif metric_name == 'memcached_items_outofmemory_total':
-                            self.memcached_outofmemory = GaugeWrapper(collector, self.metric_factory.default_labels)
-                        elif metric_name == 'memcached_items_reclaimed_total':
-                            self.memcached_reclaimed = GaugeWrapper(collector, self.metric_factory.default_labels)
+                            self.memcached_commands_total = GaugeWrapper(collector, self.metric_factory.default_labels)
+                        elif metric_name == 'memcached_get_hits_total':
+                            self.memcached_get_hits_total = GaugeWrapper(collector, self.metric_factory.default_labels)
+                        elif metric_name == 'memcached_get_misses_total':
+                            self.memcached_get_misses_total = GaugeWrapper(collector, self.metric_factory.default_labels)
+                        elif metric_name == 'memcached_reclaimed_total':
+                            self.memcached_reclaimed_total = GaugeWrapper(collector, self.metric_factory.default_labels)
+                        elif metric_name == 'memcached_bytes_read_total':
+                            self.memcached_bytes_read_total = GaugeWrapper(collector, self.metric_factory.default_labels)
+                        elif metric_name == 'memcached_bytes_written_total':
+                            self.memcached_bytes_written_total = GaugeWrapper(collector, self.metric_factory.default_labels)
+                        elif metric_name == 'memcached_rusage_user_seconds':
+                            self.memcached_rusage_user_seconds = GaugeWrapper(collector, self.metric_factory.default_labels)
+                        elif metric_name == 'memcached_rusage_system_seconds':
+                            self.memcached_rusage_system_seconds = GaugeWrapper(collector, self.metric_factory.default_labels)
                         elif metric_name == 'memcached_slab_chunk_size_bytes':
-                            self.memcached_slab_chunk_size = GaugeWrapper(collector, self.metric_factory.default_labels)
+                            self.memcached_slab_chunk_size_bytes = GaugeWrapper(collector, self.metric_factory.default_labels)
                         elif metric_name == 'memcached_slab_chunks_per_page':
                             self.memcached_slab_chunks_per_page = GaugeWrapper(collector, self.metric_factory.default_labels)
                         elif metric_name == 'memcached_slab_current_pages':
@@ -475,6 +525,13 @@ class MemcachedPrometheusExporter:
                             self.memcached_slab_current_chunks = GaugeWrapper(collector, self.metric_factory.default_labels)
                         elif metric_name == 'memcached_slab_chunks_used':
                             self.memcached_slab_chunks_used = GaugeWrapper(collector, self.metric_factory.default_labels)
+                
+                # Verify critical metrics were found
+                if not hasattr(self, 'memcached_commands_total'):
+                    self.logger.error("CRITICAL: memcached_commands_total not found in registry!")
+                    raise RuntimeError("Failed to reuse memcached_commands_total from shared registry")
+                else:
+                    self.logger.info("Successfully reused memcached_commands_total from shared registry")
             else:
                 raise
     
@@ -544,6 +601,12 @@ class MemcachedPrometheusExporter:
     async def _collect_single_instance(self, host_port: str, client: MemcachedClient):
         """Collect metrics from a single memcached instance"""
         try:
+            # Skip if client is in cooldown due to repeated failures
+            if client._consecutive_failures >= 5 and client._last_error_time:
+                if (time.time() - client._last_error_time) < 60:
+                    self.logger.debug(f"Skipping {host_port} (in cooldown period)")
+                    return
+            
             self.logger.debug(f"Collecting metrics from {host_port}")
             
             # Get cloud name if using cloud labels (for Arcus)
@@ -561,27 +624,45 @@ class MemcachedPrometheusExporter:
                 self.memcached_up.labels(address=host_port).set(1 if is_up else 0)
             
             if not is_up:
-                self.logger.warning(f"Memcached server {host_port} is not responding")
+                # Only log warning for first few failures
+                if client._consecutive_failures < 3:
+                    self.logger.warning(f"Memcached server {host_port} is not responding")
                 return
             
             # Collect stats sequentially
+            stats_collected = False
             try:
                 stats = await client.get_stats()
+                
+                # Debug: Check if command stats are present
+                cmd_stats_count = sum(1 for key in stats.keys() if key.startswith('cmd_'))
+                self.logger.debug(f"Collected {len(stats)} stats from {host_port} (cloud={cloud}), {cmd_stats_count} command stats")
+                
                 self._update_general_metrics(stats, host_port, cloud, zookeeper)
+                stats_collected = True
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout collecting general stats from {host_port} (cloud={cloud}, timeout={client.timeout}s)")
             except Exception as e:
-                self.logger.warning(f"Failed to collect general stats from {host_port}: {e}")
+                self.logger.error(f"Failed to collect general stats from {host_port} (cloud={cloud}): {e}", exc_info=True)
             
             try:
                 slab_stats = await client.get_stats_slabs()
                 self._update_slab_metrics(slab_stats, host_port)
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout collecting slab stats from {host_port} (timeout={client.timeout}s)")
             except Exception as e:
                 self.logger.warning(f"Failed to collect slab stats from {host_port}: {e}")
             
             try:
                 item_stats = await client.get_stats_items()
                 self._update_item_metrics(item_stats, host_port)
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout collecting item stats from {host_port} (timeout={client.timeout}s)")
             except Exception as e:
                 self.logger.warning(f"Failed to collect item stats from {host_port}: {e}")
+            
+            if not stats_collected:
+                self.logger.error(f"CRITICAL: No metrics collected from {host_port} - possible timeout or connection issue")
                 
         except Exception as e:
             self.logger.error(f"Failed to collect metrics from {host_port}: {e}")
@@ -621,117 +702,231 @@ class MemcachedPrometheusExporter:
             tasks.append(self._collect_node_metrics())
         
         start_time = time.time()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.time() - start_time
+        
+        # Check for exceptions in gather results
+        failed_count = 0
+        skipped_count = sum(1 for client in clients_copy.values() 
+                           if client._consecutive_failures >= 5 and client._last_error_time 
+                           and (time.time() - client._last_error_time) < 60)
+        
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                failed_count += 1
+                if i < len(clients_copy):
+                    host_port = list(clients_copy.keys())[i]
+                    # Reduce log spam for repeated failures
+                    client = clients_copy[host_port]
+                    if client._consecutive_failures < 3:
+                        self.logger.error(f"Exception collecting from {host_port}: {result}", exc_info=result)
+                    else:
+                        self.logger.debug(f"Exception collecting from {host_port}: {result}")
+                else:
+                    self.logger.error(f"Exception in collection task: {result}", exc_info=result)
         
         metrics_info = f"Collected metrics from {len(clients_copy)} memcached instances"
         if self.enable_node_metrics and self.node_collector:
             metrics_info += f" and {len(self.node_collector.hosts)} node hosts"
         metrics_info += f" in {elapsed:.2f}s"
-        self.logger.info(metrics_info)
+        if failed_count > 0 or skipped_count > 0:
+            status_parts = []
+            if failed_count > 0:
+                status_parts.append(f"{failed_count} failures")
+            if skipped_count > 0:
+                status_parts.append(f"{skipped_count} skipped")
+            metrics_info += f" ({', '.join(status_parts)})"
+            self.logger.warning(metrics_info)
+        else:
+            self.logger.info(metrics_info)
+        
+        # Additional debug info for command metrics
+        if self.use_cloud_label and hasattr(self, 'cloud_instance_map'):
+            with self._cloud_map_lock:
+                clouds = set(self.cloud_instance_map.values())
+                self.logger.debug(f"Active clouds in this collection: {clouds}")
+                
+                # Verify metrics are properly registered
+                try:
+                    from prometheus_client import generate_latest
+                    metrics_output = generate_latest(self.registry).decode('utf-8')
+                    
+                    # Count memcached_commands_total lines per cloud
+                    command_lines = [line for line in metrics_output.split('\n') if 'memcached_commands_total' in line and not line.startswith('#')]
+                    cloud_counts = {}
+                    for line in command_lines:
+                        for cloud_val in clouds:
+                            if f'cloud="{cloud_val}"' in line:
+                                cloud_counts[cloud_val] = cloud_counts.get(cloud_val, 0) + 1
+                    
+                    if cloud_counts:
+                        self.logger.info(f"Registry verification - memcached_commands_total per cloud: {cloud_counts}")
+                    else:
+                        self.logger.warning(f"Registry verification - No memcached_commands_total metrics found for expected clouds: {clouds}")
+                except Exception as e:
+                    self.logger.debug(f"Failed to verify registry: {e}")
     
     def _update_general_metrics(self, stats: Dict[str, Any], instance: str, cloud: str = None, zookeeper: str = None):
         """Update general memcached metrics"""
+        if not stats:
+            self.logger.warning(f"Empty stats received for {instance} (cloud={cloud})")
+            return
+        
         # Version info
-        if 'version' in stats:
-            if self.use_cloud_label:
-                self.memcached_version_info.labels(address=instance, cloud=cloud, zookeeper=zookeeper).info({'version': str(stats['version'])})
-            else:
-                self.memcached_version_info.labels(address=instance).info({'version': str(stats['version'])})
+        try:
+            if 'version' in stats:
+                if self.use_cloud_label:
+                    self.memcached_version_info.labels(address=instance, cloud=cloud, zookeeper=zookeeper).info({'version': str(stats['version'])})
+                else:
+                    self.memcached_version_info.labels(address=instance).info({'version': str(stats['version'])})
+        except Exception as e:
+            self.logger.error(f"Error updating version metric for {instance} (cloud={cloud}): {e}")
         
         # Connection metrics
-        if 'curr_connections' in stats:
-            if self.use_cloud_label:
-                self.memcached_current_connections.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['curr_connections'])
-            else:
-                self.memcached_current_connections.labels(address=instance).set(stats['curr_connections'])
-        if 'total_connections' in stats:
-            if self.use_cloud_label:
-                self.memcached_total_connections.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['total_connections'])
-            else:
-                self.memcached_total_connections.labels(address=instance).set(stats['total_connections'])
-        
+        try:
+            if 'curr_connections' in stats:
+                if self.use_cloud_label:
+                    self.memcached_current_connections.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['curr_connections'])
+                else:
+                    self.memcached_current_connections.labels(address=instance).set(stats['curr_connections'])
+            if 'total_connections' in stats:
+                if self.use_cloud_label:
+                    self.memcached_total_connections.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['total_connections'])
+                else:
+                    self.memcached_total_connections.labels(address=instance).set(stats['total_connections'])
+        except Exception as e:
+            self.logger.error(f"Error updating connection metrics for {instance} (cloud={cloud}): {e}")
         # Memory metrics
-        if 'limit_maxbytes' in stats:
-            if self.use_cloud_label:
-                self.memcached_limit_bytes.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['limit_maxbytes'])
-            else:
-                self.memcached_limit_bytes.labels(address=instance).set(stats['limit_maxbytes'])
-        if 'bytes' in stats:
-            if self.use_cloud_label:
-                self.memcached_bytes.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['bytes'])
-            else:
-                self.memcached_bytes.labels(address=instance).set(stats['bytes'])
+        try:
+            if 'limit_maxbytes' in stats:
+                if self.use_cloud_label:
+                    self.memcached_limit_bytes.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['limit_maxbytes'])
+                else:
+                    self.memcached_limit_bytes.labels(address=instance).set(stats['limit_maxbytes'])
+            if 'bytes' in stats:
+                if self.use_cloud_label:
+                    self.memcached_bytes.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['bytes'])
+                else:
+                    self.memcached_bytes.labels(address=instance).set(stats['bytes'])
+        except Exception as e:
+            self.logger.error(f"Error updating memory metrics for {instance} (cloud={cloud}): {e}")
         
         # Item metrics
-        if 'curr_items' in stats:
-            if self.use_cloud_label:
-                self.memcached_current_items.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['curr_items'])
-            else:
-                self.memcached_current_items.labels(address=instance).set(stats['curr_items'])
-        if 'total_items' in stats:
-            if self.use_cloud_label:
-                self.memcached_total_items.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['total_items'])
-            else:
-                self.memcached_total_items.labels(address=instance).set(stats['total_items'])
-        
-        # Command metrics
-        commands = ['get', 'set', 'delete', 'incr', 'decr', 'cas', 'touch', 'flush']
-        for cmd in commands:
-            cmd_key = f'cmd_{cmd}'
-            if cmd_key in stats:
+        try:
+            if 'curr_items' in stats:
                 if self.use_cloud_label:
-                    self.memcached_commands_total.labels(address=instance, command=cmd, cloud=cloud, zookeeper=zookeeper).set(stats[cmd_key])
+                    self.memcached_current_items.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['curr_items'])
                 else:
-                    self.memcached_commands_total.labels(address=instance, command=cmd).set(stats[cmd_key])
+                    self.memcached_current_items.labels(address=instance).set(stats['curr_items'])
+            if 'total_items' in stats:
+                if self.use_cloud_label:
+                    self.memcached_total_items.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['total_items'])
+                else:
+                    self.memcached_total_items.labels(address=instance).set(stats['total_items'])
+        except Exception as e:
+            self.logger.error(f"Error updating item metrics for {instance} (cloud={cloud}): {e}")
         
+        # Command metrics - each command update independently
+        try:
+            commands = ['get', 'set', 'delete', 'incr', 'decr', 'cas', 'touch', 'flush']
+            missing_commands = []
+            failed_commands = []
+            successful_commands = []
+            
+            # Log available cmd_* keys in stats for debugging
+            available_cmd_keys = [k for k in stats.keys() if k.startswith('cmd_')]
+            if not available_cmd_keys:
+                self.logger.warning(f"No cmd_* stats found for {instance} (cloud={cloud}). Available keys: {list(stats.keys())[:10]}...")
+            
+            for cmd in commands:
+                cmd_key = f'cmd_{cmd}'
+                if cmd_key in stats:
+                    try:
+                        # CRITICAL: Verify cloud label is set correctly
+                        metric_value = stats[cmd_key]
+                        if self.use_cloud_label:
+                            if not cloud:
+                                self.logger.error(f"Cloud label is None for {instance}, cmd={cmd}, setting to 'unknown'")
+                                cloud = 'unknown'
+                            self.logger.debug(f"Setting {cmd_key}={metric_value} for instance={instance}, cloud={cloud}, zookeeper={zookeeper}")
+                            self.memcached_commands_total.labels(address=instance, command=cmd, cloud=cloud, zookeeper=zookeeper).set(metric_value)
+                        else:
+                            self.memcached_commands_total.labels(address=instance, command=cmd).set(metric_value)
+                        successful_commands.append(cmd)
+                    except Exception as e:
+                        failed_commands.append(cmd)
+                        self.logger.error(f"Failed to set {cmd_key} metric for {instance} (cloud={cloud}): {e}", exc_info=True)
+                else:
+                    missing_commands.append(cmd)
+            
+            if successful_commands:
+                self.logger.debug(f"Updated {len(successful_commands)} command metrics for {instance} (cloud={cloud}): {successful_commands}")
+            if missing_commands:
+                self.logger.debug(f"Missing command metrics for {instance} (cloud={cloud}): {missing_commands}")
+            if failed_commands:
+                self.logger.error(f"Failed to update command metrics for {instance} (cloud={cloud}): {failed_commands}")
+        except Exception as e:
+            self.logger.error(f"Error in command metrics section for {instance} (cloud={cloud}): {e}", exc_info=True)
         # Hit/miss metrics
-        if 'get_hits' in stats:
-            if self.use_cloud_label:
-                self.memcached_get_hits_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['get_hits'])
-            else:
-                self.memcached_get_hits_total.labels(address=instance).set(stats['get_hits'])
-        if 'get_misses' in stats:
-            if self.use_cloud_label:
-                self.memcached_get_misses_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['get_misses'])
-            else:
-                self.memcached_get_misses_total.labels(address=instance).set(stats['get_misses'])
+        try:
+            if 'get_hits' in stats:
+                if self.use_cloud_label:
+                    self.memcached_get_hits_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['get_hits'])
+                else:
+                    self.memcached_get_hits_total.labels(address=instance).set(stats['get_hits'])
+            if 'get_misses' in stats:
+                if self.use_cloud_label:
+                    self.memcached_get_misses_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['get_misses'])
+                else:
+                    self.memcached_get_misses_total.labels(address=instance).set(stats['get_misses'])
+        except Exception as e:
+            self.logger.error(f"Error updating hit/miss metrics for {instance} (cloud={cloud}): {e}")
         
         # Cache metrics
-        if 'evictions' in stats:
-            if self.use_cloud_label:
-                self.memcached_evictions_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['evictions'])
-            else:
-                self.memcached_evictions_total.labels(address=instance).set(stats['evictions'])
-        if 'reclaimed' in stats:
-            if self.use_cloud_label:
-                self.memcached_reclaimed_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['reclaimed'])
-            else:
-                self.memcached_reclaimed_total.labels(address=instance).set(stats['reclaimed'])
-        
+        try:
+            if 'evictions' in stats:
+                if self.use_cloud_label:
+                    self.memcached_evictions_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['evictions'])
+                else:
+                    self.memcached_evictions_total.labels(address=instance).set(stats['evictions'])
+            if 'reclaimed' in stats:
+                if self.use_cloud_label:
+                    self.memcached_reclaimed_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['reclaimed'])
+                else:
+                    self.memcached_reclaimed_total.labels(address=instance).set(stats['reclaimed'])
+        except Exception as e:
+            self.logger.error(f"Error updating cache metrics for {instance} (cloud={cloud}): {e}")
         # Network metrics
-        if 'bytes_read' in stats:
-            if self.use_cloud_label:
-                self.memcached_bytes_read_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['bytes_read'])
-            else:
-                self.memcached_bytes_read_total.labels(address=instance).set(stats['bytes_read'])
-        if 'bytes_written' in stats:
-            if self.use_cloud_label:
-                self.memcached_bytes_written_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['bytes_written'])
-            else:
-                self.memcached_bytes_written_total.labels(address=instance).set(stats['bytes_written'])
+        try:
+            if 'bytes_read' in stats:
+                if self.use_cloud_label:
+                    self.memcached_bytes_read_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['bytes_read'])
+                else:
+                    self.memcached_bytes_read_total.labels(address=instance).set(stats['bytes_read'])
+            if 'bytes_written' in stats:
+                if self.use_cloud_label:
+                    self.memcached_bytes_written_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['bytes_written'])
+                else:
+                    self.memcached_bytes_written_total.labels(address=instance).set(stats['bytes_written'])
+        except Exception as e:
+            self.logger.error(f"Error updating network metrics for {instance} (cloud={cloud}): {e}")
         
         # CPU metrics
-        if 'rusage_user' in stats:
-            if self.use_cloud_label:
-                self.memcached_rusage_user_seconds.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['rusage_user'])
-            else:
-                self.memcached_rusage_user_seconds.labels(address=instance).set(stats['rusage_user'])
-        if 'rusage_system' in stats:
-            if self.use_cloud_label:
-                self.memcached_rusage_system_seconds.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['rusage_system'])
-            else:
-                self.memcached_rusage_system_seconds.labels(address=instance).set(stats['rusage_system'])
+        try:
+            if 'rusage_user' in stats:
+                if self.use_cloud_label:
+                    self.memcached_rusage_user_seconds.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['rusage_user'])
+                else:
+                    self.memcached_rusage_user_seconds.labels(address=instance).set(stats['rusage_user'])
+            if 'rusage_system' in stats:
+                if self.use_cloud_label:
+                    self.memcached_rusage_system_seconds.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['rusage_system'])
+                else:
+                    self.memcached_rusage_system_seconds.labels(address=instance).set(stats['rusage_system'])
+        except Exception as e:
+            self.logger.error(f"Error updating CPU metrics for {instance} (cloud={cloud}): {e}")
+        
+        self.logger.debug(f"Updated {len(stats)} general metrics for {instance} (cloud={cloud})")
     
     def _update_slab_metrics(self, stats: Dict[str, Any], instance: str):
         """Update slab-related metrics"""
