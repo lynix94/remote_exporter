@@ -41,7 +41,7 @@ ONE_LINE_COMMANDS = {
 class MemcachedClient:
     """Simple memcached client for collecting statistics with connection pooling"""
     
-    def __init__(self, host: str = 'localhost', port: int = 11211, timeout: float = 5.0):
+    def __init__(self, host: str = 'localhost', port: int = 11211, timeout: float = 10.0):
         self.host = host
         self.port = port
         self.timeout = timeout
@@ -495,23 +495,34 @@ class MemcachedPrometheusExporter:
                 return
             
             # Collect stats sequentially
+            stats_collected = False
             try:
                 stats = await client.get_stats()
                 self._update_general_metrics(stats, host_port)
+                stats_collected = True
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout collecting general stats from {host_port} (timeout={client.timeout}s)")
             except Exception as e:
-                self.logger.warning(f"Failed to collect general stats from {host_port}: {e}")
+                self.logger.error(f"Failed to collect general stats from {host_port}: {e}", exc_info=True)
             
             try:
                 slab_stats = await client.get_stats_slabs()
                 self._update_slab_metrics(slab_stats, host_port)
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout collecting slab stats from {host_port} (timeout={client.timeout}s)")
             except Exception as e:
                 self.logger.warning(f"Failed to collect slab stats from {host_port}: {e}")
             
             try:
                 item_stats = await client.get_stats_items()
                 self._update_item_metrics(item_stats, host_port)
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout collecting item stats from {host_port} (timeout={client.timeout}s)")
             except Exception as e:
                 self.logger.warning(f"Failed to collect item stats from {host_port}: {e}")
+            
+            if not stats_collected:
+                self.logger.error(f"CRITICAL: No metrics collected from {host_port} - possible timeout or connection issue")
                 
         except Exception as e:
             self.logger.error(f"Failed to collect metrics from {host_port}: {e}")
@@ -543,69 +554,103 @@ class MemcachedPrometheusExporter:
             tasks.append(self._collect_node_metrics())
         
         start_time = time.time()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.time() - start_time
+        
+        # Check for exceptions in gather results
+        failed_count = 0
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                failed_count += 1
+                if i < len(clients_copy):
+                    host_port = list(clients_copy.keys())[i]
+                    self.logger.error(f"Exception collecting from {host_port}: {result}", exc_info=result)
+                else:
+                    self.logger.error(f"Exception in collection task: {result}", exc_info=result)
         
         metrics_info = f"Collected metrics from {len(clients_copy)} memcached instances"
         if self.enable_node_metrics and self.node_collector:
             metrics_info += f" and {len(self.node_collector.hosts)} node hosts"
         metrics_info += f" in {elapsed:.2f}s"
-        self.logger.info(metrics_info)
+        if failed_count > 0:
+            metrics_info += f" ({failed_count} failures)"
+            self.logger.warning(metrics_info)
+        else:
+            self.logger.info(metrics_info)
     
     def _update_general_metrics(self, stats: Dict[str, Any], instance: str):
         """Update general memcached metrics"""
-        # Version info
-        if 'version' in stats:
-            self.memcached_version_info.labels(address=instance).info({'version': str(stats['version'])})
+        if not stats:
+            self.logger.warning(f"Empty stats received for {instance}")
+            return
         
-        # Connection metrics
-        if 'curr_connections' in stats:
-            self.memcached_current_connections.labels(address=instance).set(stats['curr_connections'])
-        if 'total_connections' in stats:
-            self.memcached_total_connections.labels(address=instance).set(stats['total_connections'])
-        
-        # Memory metrics
-        if 'limit_maxbytes' in stats:
-            self.memcached_limit_bytes.labels(address=instance).set(stats['limit_maxbytes'])
-        if 'bytes' in stats:
-            self.memcached_bytes.labels(address=instance).set(stats['bytes'])
-        
-        # Item metrics
-        if 'curr_items' in stats:
-            self.memcached_current_items.labels(address=instance).set(stats['curr_items'])
-        if 'total_items' in stats:
-            self.memcached_total_items.labels(address=instance).set(stats['total_items'])
-        
-        # Command metrics
-        commands = ['get', 'set', 'delete', 'incr', 'decr', 'cas', 'touch', 'flush']
-        for cmd in commands:
-            cmd_key = f'cmd_{cmd}'
-            if cmd_key in stats:
-                self.memcached_commands_total.labels(address=instance, command=cmd).set(stats[cmd_key])
-        
-        # Hit/miss metrics
-        if 'get_hits' in stats:
-            self.memcached_get_hits_total.labels(address=instance).set(stats['get_hits'])
-        if 'get_misses' in stats:
-            self.memcached_get_misses_total.labels(address=instance).set(stats['get_misses'])
-        
-        # Cache metrics
-        if 'evictions' in stats:
-            self.memcached_evictions_total.labels(address=instance).set(stats['evictions'])
-        if 'reclaimed' in stats:
-            self.memcached_reclaimed_total.labels(address=instance).set(stats['reclaimed'])
-        
-        # Network metrics
-        if 'bytes_read' in stats:
-            self.memcached_bytes_read_total.labels(address=instance).set(stats['bytes_read'])
-        if 'bytes_written' in stats:
-            self.memcached_bytes_written_total.labels(address=instance).set(stats['bytes_written'])
-        
-        # CPU metrics
-        if 'rusage_user' in stats:
-            self.memcached_rusage_user_seconds.labels(address=instance).set(stats['rusage_user'])
-        if 'rusage_system' in stats:
-            self.memcached_rusage_system_seconds.labels(address=instance).set(stats['rusage_system'])
+        try:
+            # Version info
+            if 'version' in stats:
+                self.memcached_version_info.labels(address=instance).info({'version': str(stats['version'])})
+            
+            # Connection metrics
+            if 'curr_connections' in stats:
+                self.memcached_current_connections.labels(address=instance).set(stats['curr_connections'])
+            if 'total_connections' in stats:
+                self.memcached_total_connections.labels(address=instance).set(stats['total_connections'])
+            
+            # Memory metrics
+            if 'limit_maxbytes' in stats:
+                self.memcached_limit_bytes.labels(address=instance).set(stats['limit_maxbytes'])
+            if 'bytes' in stats:
+                self.memcached_bytes.labels(address=instance).set(stats['bytes'])
+            
+            # Item metrics
+            if 'curr_items' in stats:
+                self.memcached_current_items.labels(address=instance).set(stats['curr_items'])
+            if 'total_items' in stats:
+                self.memcached_total_items.labels(address=instance).set(stats['total_items'])
+            
+            # Command metrics
+            commands = ['get', 'set', 'delete', 'incr', 'decr', 'cas', 'touch', 'flush']
+            missing_commands = []
+            for cmd in commands:
+                cmd_key = f'cmd_{cmd}'
+                if cmd_key in stats:
+                    try:
+                        self.memcached_commands_total.labels(address=instance, command=cmd).set(stats[cmd_key])
+                    except Exception as e:
+                        self.logger.error(f"Failed to set {cmd_key} metric for {instance}: {e}")
+                else:
+                    missing_commands.append(cmd)
+            
+            if missing_commands:
+                self.logger.debug(f"Missing command metrics for {instance}: {missing_commands}")
+            
+            # Hit/miss metrics
+            if 'get_hits' in stats:
+                self.memcached_get_hits_total.labels(address=instance).set(stats['get_hits'])
+            if 'get_misses' in stats:
+                self.memcached_get_misses_total.labels(address=instance).set(stats['get_misses'])
+            
+            # Cache metrics
+            if 'evictions' in stats:
+                self.memcached_evictions_total.labels(address=instance).set(stats['evictions'])
+            if 'reclaimed' in stats:
+                self.memcached_reclaimed_total.labels(address=instance).set(stats['reclaimed'])
+            
+            # Network metrics
+            if 'bytes_read' in stats:
+                self.memcached_bytes_read_total.labels(address=instance).set(stats['bytes_read'])
+            if 'bytes_written' in stats:
+                self.memcached_bytes_written_total.labels(address=instance).set(stats['bytes_written'])
+            
+            # CPU metrics
+            if 'rusage_user' in stats:
+                self.memcached_rusage_user_seconds.labels(address=instance).set(stats['rusage_user'])
+            if 'rusage_system' in stats:
+                self.memcached_rusage_system_seconds.labels(address=instance).set(stats['rusage_system'])
+            
+            self.logger.debug(f"Updated {len(stats)} general metrics for {instance}")
+            
+        except Exception as e:
+            self.logger.error(f"Error updating general metrics for {instance}: {e}", exc_info=True)
     
     def _update_slab_metrics(self, stats: Dict[str, Any], instance: str):
         """Update slab-related metrics"""

@@ -400,6 +400,56 @@ The following parameters are available for all exporters:
 - Ensure SSH keys have proper permissions (chmod 600)
 - Use dedicated monitoring user with minimal permissions
 
+## Troubleshooting
+
+### Missing Metrics
+
+If you notice metrics are missing (e.g., labels like `cloud="band"` not appearing), check the following:
+
+**1. Check Timeout Settings**
+- Default timeout increased to 10 seconds for better reliability
+- Network delays can cause collection failures
+- Increase timeout if collecting from slow/remote servers
+
+**2. Enable Debug Logging**
+```bash
+remote_exporter arcus --zookeeper-addr localhost:2181 \
+    --cloud-name ".*" \
+    --log-level DEBUG
+```
+
+**3. Common Issues**
+- **Timeout errors**: Look for `Timeout collecting` messages in logs
+  - Solution: Check network connectivity, increase timeout
+- **Connection failures**: Check `Failed to connect` messages
+  - Solution: Verify server addresses and ports
+- **Empty stats**: Look for `Empty stats received` warnings
+  - Solution: Verify server is healthy and responding to stats commands
+- **Missing command metrics**: Check DEBUG logs for `Missing command metrics`
+  - This is normal - some commands may not be used by all servers
+
+**4. Monitor Collection Failures**
+The exporter now logs detailed failure information:
+- Individual instance failures with error details
+- Collection summary includes failure count
+- Critical errors for completely failed collections
+
+**5. Example Debug Output**
+```
+2026-02-18 10:00:01 - ERROR - Timeout collecting general stats from 192.168.1.10:11211 (timeout=10s)
+2026-02-18 10:00:02 - ERROR - CRITICAL: No metrics collected from 192.168.1.10:11211 - possible timeout or connection issue
+2026-02-18 10:00:03 - WARNING - Collected metrics from 10 memcached instances in 2.34s (2 failures)
+```
+
+**6. Verify Data in Prometheus**
+```promql
+# Check if metrics are being collected for all expected labels
+count by (cloud) (memcached_commands_total)
+
+# Check collection failures
+rate(memcached_up{job="arcus"}[5m]) < 1
+```
+
 ## License
 
 MIT License

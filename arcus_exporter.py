@@ -199,7 +199,15 @@ class ArcusPrometheusExporter(MemcachedPrometheusExporter):
                 return
             
             # Get stats from the Arcus server
-            stats = await client.get_stats()
+            try:
+                stats = await asyncio.wait_for(client.get_stats(), timeout=client.timeout)
+            except asyncio.TimeoutError:
+                self.logger.error(f"Timeout collecting Arcus stats from {instance} (timeout={client.timeout}s)")
+                return
+            
+            if not stats:
+                self.logger.warning(f"Empty Arcus stats received for {instance}")
+                return
             
             # Update Arcus collection command metrics
             lop_commands = {
