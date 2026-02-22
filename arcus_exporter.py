@@ -38,7 +38,8 @@ class ArcusPrometheusExporter(MemcachedPrometheusExporter):
                  ssh_username: str = None,
                  ssh_key_file: str = None,
                  ssh_port: int = 22,
-                 shared_node_collector=None):
+                 shared_node_collector=None,
+                 debug_metric: str = None):
         
         # ZooKeeper settings
         self.zookeeper_addr = zookeeper_addr
@@ -66,7 +67,8 @@ class ArcusPrometheusExporter(MemcachedPrometheusExporter):
             ssh_key_file=ssh_key_file,
             ssh_port=ssh_port,
             use_cloud_label=True,
-            zookeeper_addr=zookeeper_addr
+            zookeeper_addr=zookeeper_addr,
+            debug_metric=debug_metric
         )
         
         # Setup ZooKeeper watcher

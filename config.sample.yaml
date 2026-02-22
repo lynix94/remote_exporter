@@ -39,6 +39,9 @@ exporters:
     # Node metrics enabled (uses global SSH settings)
     enable_node_metrics: true
     include_k8s_node: false         # Exclude K8s nodes (default)
+    
+    # Debug specific metric changes (optional)
+    # debug_metric: memcached_commands_total
 
   # Example 3: Memcached exporter - static memcached addresses
   - type: memcached
@@ -49,6 +52,12 @@ exporters:
     
     # Node metrics enabled for this instance
     enable_node_metrics: true
+    
+    # Debug specific metric changes (optional)
+    # Examples:
+    #   debug_metric: memcached_commands_total
+    #   debug_metric: memcached_commands_total{address="10.0.1.10:11211",command="get"}
+    debug_metric: memcached_commands_total
 
   # Example 4: Redis standalone exporter
   - type: redis

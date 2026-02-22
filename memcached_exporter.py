@@ -240,7 +240,8 @@ class MemcachedPrometheusExporter:
                  ssh_key_file: str = None,
                  ssh_port: int = 22,
                  use_cloud_label: bool = False,
-                 zookeeper_addr: str = None):
+                 zookeeper_addr: str = None,
+                 debug_metric: str = None):
         
         self.memcached_addrs = memcached_addrs or []
         self.memcached_clients = {}
@@ -248,6 +249,7 @@ class MemcachedPrometheusExporter:
         self.max_concurrent = max_concurrent
         self.use_cloud_label = use_cloud_label
         self.zookeeper_addr = zookeeper_addr
+        self.debug_metric = debug_metric
         
         # Node exporter settings
         self.enable_node_metrics = enable_node_metrics
@@ -766,6 +768,38 @@ class MemcachedPrometheusExporter:
                 except Exception as e:
                     self.logger.debug(f"Failed to verify registry: {e}")
     
+    def _debug_metric_change(self, metric_name: str, labels: Dict[str, str], prev_value, new_value):
+        """Output metric change to stdout if debug_metric matches"""
+        if not self.debug_metric:
+            return
+        
+        # Check if metric name matches
+        if metric_name not in self.debug_metric:
+            return
+        
+        # If debug_metric contains '{', it has label filters
+        if '{' in self.debug_metric:
+            # Extract label filters from debug_metric
+            # Format: metric_name{label1="value1",label2="value2"}
+            import re
+            label_pattern = re.findall(r'(\w+)="([^"]+)"', self.debug_metric)
+            if label_pattern:
+                # Check if all specified labels match
+                for label_key, label_value in label_pattern:
+                    if labels.get(label_key) != label_value:
+                        return  # Label doesn't match, skip
+        
+        # Build output with timestamp
+        from datetime import datetime
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        labels_str = ', '.join([f'{k}="{v}"' for k, v in labels.items()])
+        diff = new_value - prev_value if prev_value is not None else None
+        
+        if prev_value is not None:
+            print(f"[{timestamp}] {metric_name}{{{labels_str}}} {prev_value} -> {new_value} (diff: {diff})")
+        else:
+            print(f"[{timestamp}] {metric_name}{{{labels_str}}} INIT -> {new_value}")
+    
     def _update_general_metrics(self, stats: Dict[str, Any], instance: str, cloud: str = None, zookeeper: str = None):
         """Update general memcached metrics"""
         if not stats:
@@ -844,11 +878,29 @@ class MemcachedPrometheusExporter:
                     try:
                         # CRITICAL: Verify cloud label is set correctly
                         metric_value = stats[cmd_key]
+                        
+                        # Build labels dict
                         if self.use_cloud_label:
                             if not cloud:
                                 self.logger.error(f"Cloud label is None for {instance}, cmd={cmd}, setting to 'unknown'")
                                 cloud = 'unknown'
-                            self.logger.debug(f"Setting {cmd_key}={metric_value} for instance={instance}, cloud={cloud}, zookeeper={zookeeper}")
+                            labels = {'address': instance, 'command': cmd, 'cloud': cloud, 'zookeeper': zookeeper}
+                        else:
+                            labels = {'address': instance, 'command': cmd}
+                        
+                        # Get previous value for comparison and debug output
+                        try:
+                            if self.use_cloud_label:
+                                prev_value = self.memcached_commands_total.get(address=instance, command=cmd, cloud=cloud, zookeeper=zookeeper)
+                            else:
+                                prev_value = self.memcached_commands_total.get(address=instance, command=cmd)
+                            
+                            self._debug_metric_change('memcached_commands_total', labels, prev_value, metric_value)
+                        except (AttributeError, KeyError):
+                            # First time setting this metric
+                            self._debug_metric_change('memcached_commands_total', labels, None, metric_value)
+                        
+                        if self.use_cloud_label:
                             self.memcached_commands_total.labels(address=instance, command=cmd, cloud=cloud, zookeeper=zookeeper).set(metric_value)
                         else:
                             self.memcached_commands_total.labels(address=instance, command=cmd).set(metric_value)
@@ -869,45 +921,96 @@ class MemcachedPrometheusExporter:
             self.logger.error(f"Error in command metrics section for {instance} (cloud={cloud}): {e}", exc_info=True)
         # Hit/miss metrics
         try:
+            labels = {'address': instance, 'cloud': cloud, 'zookeeper': zookeeper} if self.use_cloud_label else {'address': instance}
+            
             if 'get_hits' in stats:
+                metric_value = stats['get_hits']
+                try:
+                    prev_value = self.memcached_get_hits_total.get(**labels)
+                    self._debug_metric_change('memcached_get_hits_total', labels, prev_value, metric_value)
+                except (AttributeError, KeyError):
+                    self._debug_metric_change('memcached_get_hits_total', labels, None, metric_value)
+                
                 if self.use_cloud_label:
-                    self.memcached_get_hits_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['get_hits'])
+                    self.memcached_get_hits_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(metric_value)
                 else:
-                    self.memcached_get_hits_total.labels(address=instance).set(stats['get_hits'])
+                    self.memcached_get_hits_total.labels(address=instance).set(metric_value)
+            
             if 'get_misses' in stats:
+                metric_value = stats['get_misses']
+                try:
+                    prev_value = self.memcached_get_misses_total.get(**labels)
+                    self._debug_metric_change('memcached_get_misses_total', labels, prev_value, metric_value)
+                except (AttributeError, KeyError):
+                    self._debug_metric_change('memcached_get_misses_total', labels, None, metric_value)
+                
                 if self.use_cloud_label:
-                    self.memcached_get_misses_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['get_misses'])
+                    self.memcached_get_misses_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(metric_value)
                 else:
-                    self.memcached_get_misses_total.labels(address=instance).set(stats['get_misses'])
+                    self.memcached_get_misses_total.labels(address=instance).set(metric_value)
         except Exception as e:
             self.logger.error(f"Error updating hit/miss metrics for {instance} (cloud={cloud}): {e}")
         
         # Cache metrics
         try:
+            labels = {'address': instance, 'cloud': cloud, 'zookeeper': zookeeper} if self.use_cloud_label else {'address': instance}
+            
             if 'evictions' in stats:
+                metric_value = stats['evictions']
+                try:
+                    prev_value = self.memcached_evictions_total.get(**labels)
+                    self._debug_metric_change('memcached_evictions_total', labels, prev_value, metric_value)
+                except (AttributeError, KeyError):
+                    self._debug_metric_change('memcached_evictions_total', labels, None, metric_value)
+                
                 if self.use_cloud_label:
-                    self.memcached_evictions_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['evictions'])
+                    self.memcached_evictions_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(metric_value)
                 else:
-                    self.memcached_evictions_total.labels(address=instance).set(stats['evictions'])
+                    self.memcached_evictions_total.labels(address=instance).set(metric_value)
+            
             if 'reclaimed' in stats:
+                metric_value = stats['reclaimed']
+                try:
+                    prev_value = self.memcached_reclaimed_total.get(**labels)
+                    self._debug_metric_change('memcached_reclaimed_total', labels, prev_value, metric_value)
+                except (AttributeError, KeyError):
+                    self._debug_metric_change('memcached_reclaimed_total', labels, None, metric_value)
+                
                 if self.use_cloud_label:
-                    self.memcached_reclaimed_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['reclaimed'])
+                    self.memcached_reclaimed_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(metric_value)
                 else:
-                    self.memcached_reclaimed_total.labels(address=instance).set(stats['reclaimed'])
+                    self.memcached_reclaimed_total.labels(address=instance).set(metric_value)
         except Exception as e:
             self.logger.error(f"Error updating cache metrics for {instance} (cloud={cloud}): {e}")
         # Network metrics
         try:
+            labels = {'address': instance, 'cloud': cloud, 'zookeeper': zookeeper} if self.use_cloud_label else {'address': instance}
+            
             if 'bytes_read' in stats:
+                metric_value = stats['bytes_read']
+                try:
+                    prev_value = self.memcached_bytes_read_total.get(**labels)
+                    self._debug_metric_change('memcached_bytes_read_total', labels, prev_value, metric_value)
+                except (AttributeError, KeyError):
+                    self._debug_metric_change('memcached_bytes_read_total', labels, None, metric_value)
+                
                 if self.use_cloud_label:
-                    self.memcached_bytes_read_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['bytes_read'])
+                    self.memcached_bytes_read_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(metric_value)
                 else:
-                    self.memcached_bytes_read_total.labels(address=instance).set(stats['bytes_read'])
+                    self.memcached_bytes_read_total.labels(address=instance).set(metric_value)
+            
             if 'bytes_written' in stats:
+                metric_value = stats['bytes_written']
+                try:
+                    prev_value = self.memcached_bytes_written_total.get(**labels)
+                    self._debug_metric_change('memcached_bytes_written_total', labels, prev_value, metric_value)
+                except (AttributeError, KeyError):
+                    self._debug_metric_change('memcached_bytes_written_total', labels, None, metric_value)
+                
                 if self.use_cloud_label:
-                    self.memcached_bytes_written_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(stats['bytes_written'])
+                    self.memcached_bytes_written_total.labels(address=instance, cloud=cloud, zookeeper=zookeeper).set(metric_value)
                 else:
-                    self.memcached_bytes_written_total.labels(address=instance).set(stats['bytes_written'])
+                    self.memcached_bytes_written_total.labels(address=instance).set(metric_value)
         except Exception as e:
             self.logger.error(f"Error updating network metrics for {instance} (cloud={cloud}): {e}")
         
@@ -1023,6 +1126,10 @@ def run_memcached_exporter(args_list=None):
     parser.add_argument('--log-level', default='INFO',
                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
                        help='Log level (default: INFO)')
+    parser.add_argument('--debug-metric',
+                       help='Debug specific metric changes to stdout. '
+                            'Examples: memcached_commands_total or '
+                            'memcached_commands_total{address="10.1.2.3:11211",command="get"}')
     
     # Node metrics arguments
     parser.add_argument('--enable-node-metrics', action='store_true',
@@ -1061,7 +1168,8 @@ def run_memcached_exporter(args_list=None):
         exclude_k8s_node=not args.include_k8s_node,
         ssh_username=args.ssh_username,
         ssh_key_file=args.ssh_key_file,
-        ssh_port=args.ssh_port
+        ssh_port=args.ssh_port,
+        debug_metric=args.debug_metric
     )
     
     exporter.start()

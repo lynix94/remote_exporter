@@ -427,7 +427,8 @@ def run_exporter_from_config(exporter_type: str, config: dict, log_level: str,
                 ssh_username=ssh_username,  # Use global SSH username
                 ssh_key_file=ssh_key_file,  # Use global SSH key file
                 ssh_port=ssh_port,  # Use global SSH port
-                shared_node_collector=shared_node_collector  # Pass shared node collector
+                shared_node_collector=shared_node_collector,  # Pass shared node collector
+                debug_metric=config.get('debug_metric')
             )
             
             logger.warning(f"[MAIN] After creation, exporter.shared_node_collector = {exporter.shared_node_collector}")
@@ -470,7 +471,8 @@ def run_exporter_from_config(exporter_type: str, config: dict, log_level: str,
                 exclude_k8s_node=True,
                 ssh_username=ssh_username,  # Use global SSH username
                 ssh_key_file=ssh_key_file,  # Use global SSH key file
-                ssh_port=ssh_port  # Use global SSH port
+                ssh_port=ssh_port,  # Use global SSH port
+                debug_metric=config.get('debug_metric')
             )
             
             # Replace registry with shared one
